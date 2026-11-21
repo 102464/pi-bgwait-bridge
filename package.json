@@ -12,19 +12,27 @@
   "files": [
     "extensions",
     "src",
-    "docs",
     "test",
     "scripts",
+    "evidence",
     "README.md",
     "AGENTS.md",
-    "SOURCE-AUDIT.md",
-    "COMPATIBILITY.md"
+    "COMPATIBILITY.md",
+    "SOURCE-AUDIT.md"
   ],
   "scripts": {
     "test": "node --test test/*.test.ts",
+    "typecheck": "tsc --noEmit",
+    "check": "npm run typecheck && npm test",
     "live-e2e": "node scripts/live-e2e.mjs"
   },
   "engines": {
     "node": ">=22.6"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^1.6.0",
+    "@types/node": "^26.6.6",
+    "pi-subagents": "^0.89.2",
+    "typescript": "^7.0.2"
   }
 }

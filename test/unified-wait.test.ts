@@ -13,6 +13,7 @@ import { createBridge } from "../src/bridge.ts";
 import { PROVIDER_NAME } from "../src/constants.ts";
 import { createUnifiedToolRunner } from "../src/unified-tool.ts";
 import { FakeBackgroundTaskHost, FakeEventBus, tick, until } from "./doubles.ts";
+import type { DoubleTask } from "./doubles.ts";
 import type { WaitTargetTask } from "../src/types.ts";
 
 interface HarnessOptions {
@@ -40,7 +41,7 @@ function harness(options: HarnessOptions = {}) {
   return { bus, host, bridge, runner };
 }
 
-function task(id: string, overrides: Partial<WaitTargetTask> = {}): WaitTargetTask {
+function task(id: string, overrides: Partial<DoubleTask> = {}): DoubleTask {
   return {
     id,
     name: `task ${id}`,
@@ -49,7 +50,7 @@ function task(id: string, overrides: Partial<WaitTargetTask> = {}): WaitTargetTa
     startTime: Date.now(),
     isAgent: false,
     ...overrides,
-  } as WaitTargetTask;
+  };
 }
 
 async function start(h: ReturnType<typeof harness>, ids: string[]): Promise<void> {

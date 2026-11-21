@@ -19,7 +19,7 @@ interface Item {
 }
 
 /** Reimplementation of pi-subagents' validation + filtering, so provider output is checked as it is consumed. */
-function snapshot(providers: { name: string; wakeChannels?: readonly string[]; listActiveWork(context?: { sessionId: string; sessionIds: readonly string[] }): readonly Item[]; reconcile?(context: { sessionId: string; sessionIds: readonly string[]; nowMs: number }): void }[], sessionIds: string[]) {
+function snapshot(providers: { name: string; wakeChannels?: readonly string[]; listActiveWork(context?: { sessionId: string; sessionIds: readonly string[]; nowMs: number }): readonly Item[]; reconcile?(context: { sessionId: string; sessionIds: readonly string[]; nowMs: number }): void }[], sessionIds: string[]) {
   const accepted = [...new Set(sessionIds)];
   const first = accepted[0];
   if (first === undefined) throw new Error("snapshot needs a session id");

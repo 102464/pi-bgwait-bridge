@@ -1,0 +1,18 @@
+# Build / test artifacts — not source.
+
+node_modules/
+*.tgz
+
+# Pi session + background-task state (per-machine, never portable).
+.pi/
+
+# Live-E2E and unit-test output. `evidence/` is documentation-referenced
+# (COMPATIBILITY.md cites each run log by name, including the `-installed`
+# variants), so the whole directory is tracked on purpose. Do not add per-file
+# rules here: a log that ships with a compatibility claim must stay in the tree.
+
+# Editors / OS
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

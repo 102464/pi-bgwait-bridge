@@ -390,7 +390,7 @@ export function createBridge(options: BridgeOptions): Bridge {
           now,
         });
       try {
-        if (!record || !host.hasLease()) await doSubscribe();
+        if (!record || !host.hasLease()) await host.subscribe();
         const detail = await host.detail(id);
         if ("error" in detail) return { owned: record !== undefined, error: detail.error };
         // The detail response carries the same trusted launch record as subscribe/list;
