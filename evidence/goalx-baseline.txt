@@ -1,0 +1,7 @@
+BASELINE activeSeconds=7111 tokens=957560 status=active autoContinue=true
+BEFORE_WAIT activeSeconds=7145 status=active autoContinue=true
+=== live-session pre-reload check (Sat Nov 21 21:34:42     2026) ===
+installed in user settings: 1 entry
+bg_wait({all:true,stopOnAttention:false,timeoutMs:300000}) -> 'No active async runs or registered provider work in this session. Nothing to wait for.'
+while task b196781e1 (61s ping) was still running => extension not loaded in this process (session predates install; needs /reload).
+after-wait activeSeconds=7186 status=active autoContinue=true

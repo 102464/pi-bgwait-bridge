@@ -1,0 +1,11 @@
+PASS  pi exited 0  — exit=0
+PASS  model replied MIXED_DONE
+PASS  background task launched  — be56d18b8
+PASS  background task is provider work  — items=1
+PASS  native bg_wait reported BOTH scopes in one call  — Waited 19.0s for 1 async run(s) and 1 provider item(s); done. Outcome: 1 complete, 1 provider item(s) finished.
+PASS  native bg_wait waited for both, not just the first to finish  — Waited 19.0s for 1 async run(s) and 1 provider item(s); done. Outcome: 1 complete, 1 provider item(s) finished.
+PASS  the wait blocked past the subagent's own runtime (background task outlived it)  — waited=18963ms
+PASS  the wait ended done, not on timeout
+PASS  bg_wait_unified then resolves the exact background task id  — Waited 0ms for 1 background task(s); all settled. |  | Results: | - be56d18b8 completed exit=0
+
+9 mixed-scope live checks passed.

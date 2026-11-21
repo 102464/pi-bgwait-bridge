@@ -1,0 +1,12 @@
+PASS  pi exited 0  — exit=0
+PASS  model replied PROBE_DONE
+PASS  bg_wait is registered in the live session
+PASS  bg_wait_unified is registered in the live session
+PASS  host activation belongs to this session  — activation=act-c99f6424a18418d0a7a3179586c95233
+PASS  a real background task was launched  — bc14cb7c9
+PASS  the task is provider work visible to bg_wait  — items=1
+PASS  native bg_wait no longer says 'No active async runs'  — Waited 1.0s for 0 async run(s) and 1 provider item(s); done. Outcome: 1 provider item(s) finished. Completion/control events have been observed; inspect status if a notification is not visible yet.
+PASS  native bg_wait waited on the provider item and finished  — Waited 1.0s for 0 async run(s) and 1 provider item(s); done. Outcome: 1 provider item(s) finished. Completion/control events have been observed; inspect status if a notification is not visible yet.
+PASS  bg_wait_unified resolved the exact task id  — Waited 0ms for 1 background task(s); all settled. |  | Results: | - bc14cb7c9 completed exit=0
+
+10 live checks passed.

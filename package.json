@@ -1,0 +1,30 @@
+{
+  "name": "pi-bgwait-bridge",
+  "version": "0.1.0",
+  "description": "Bridge pi-background-tasks native background work into pi-subagents bg_wait, plus a unified wait tool for exact background task ids.",
+  "type": "module",
+  "license": "MIT",
+  "pi": {
+    "extensions": [
+      "./extensions/bgwait-bridge.ts"
+    ]
+  },
+  "files": [
+    "extensions",
+    "src",
+    "docs",
+    "test",
+    "scripts",
+    "README.md",
+    "AGENTS.md",
+    "SOURCE-AUDIT.md",
+    "COMPATIBILITY.md"
+  ],
+  "scripts": {
+    "test": "node --test test/*.test.ts",
+    "live-e2e": "node scripts/live-e2e.mjs"
+  },
+  "engines": {
+    "node": ">=22.6"
+  }
+}
