@@ -47,14 +47,23 @@ function fakePi(): FakePi {
   return api;
 }
 
-function fakeContext(sessionId: string, sessionFile: string | undefined, cwd = "C:/work") {
+function fakeContext(
+  sessionId: string,
+  sessionFile: string | undefined,
+  cwd = "C:/work",
+  /** How the nested native tool answers; the default reports "no native tool". */
+  executeTool: (name: string, params: unknown, options?: { signal?: AbortSignal }) => Promise<unknown> = async () => ({
+    isError: true,
+    result: { content: [{ type: "text", text: "no native tool" }] },
+  }),
+) {
   return {
     cwd,
     sessionManager: {
       getSessionId: () => sessionId,
       getSessionFile: () => sessionFile,
     },
-    executeTool: async () => ({ isError: true, result: { content: [{ type: "text", text: "no native tool" }] } }),
+    executeTool,
   };
 }
 
@@ -300,3 +309,92 @@ async function ownedRunDir(sessionId: string): Promise<string> {
   writeFileSync(path.join(dir, "status.json"), JSON.stringify({ sessionId }), "utf8");
   return dir;
 }
+
+test("an `any` wait for a subagent alone does not answer before the native scope settles", async () => {
+  // Reported by the operator (`any=true`): with no background task of its own and one async
+  // subagent live, the call answered at once with `No background task of this session is
+  // running.` and `Native wait: native bg_wait failed: Operation aborted` — `any` treated an
+  // empty id scope as a first completion, retired the native half before it observed the run,
+  // and reported the abort it had itself caused as a native failure.
+  const pi = fakePi();
+  const activate = await loadExtension();
+  activate(pi as never);
+  // The native tool has to be *registered* for the extension to attempt the nested call at all.
+  pi.tools.push({ name: "bg_wait", parameters: {}, execute: async () => ({}) });
+  const seen: Record<string, unknown>[] = [];
+  const ctx = fakeContext("sess-A", "C:/sessions/A.jsonl", "C:/work", async (name, params, options) => {
+    seen.push({ name, params });
+    const signal = options?.signal;
+    // A live async run that settles 260 ms into the nested wait: only the native half can see it.
+    return await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => resolve({ result: { content: [{ type: "text", text: "Waited 0.3s for 1 async run(s); done." }] } }), 260);
+      signal?.addEventListener(
+        "abort",
+        () => {
+          clearTimeout(timer);
+          reject(new Error("Operation aborted"));
+        },
+        { once: true },
+      );
+    });
+  });
+  await pi.emitTo("session_start", { reason: "startup" }, ctx);
+  const tool = pi.tools.find((entry) => entry.name === "bg_wait_unified");
+  assert.ok(tool);
+  const startedAt = Date.now();
+  const result = (await tool.execute("call-any", { any: true, includeNative: true, timeoutMs: 4000 }, undefined, undefined, ctx)) as {
+    content: { text: string }[];
+  };
+  const elapsed = Date.now() - startedAt;
+  const text = result.content[0]?.text ?? "";
+  assert.ok(elapsed >= 200, `an empty background scope must not satisfy \`any\` (${String(elapsed)}ms)`);
+  assert.match(text, /1 async run\(s\); done/, "the native answer must be passed through");
+  assert.doesNotMatch(text, /Operation aborted/, "the native half was not aborted before it answered");
+  assert.equal(seen[0]?.name, "bg_wait");
+  assert.equal((seen[0]?.params as { all?: boolean }).all, false, "`any` forwards all:false to the native half");
+});
+
+test("a native wait released by this tool's own abort is a release note, not a failure", async () => {
+  // The abort lands inside the native tool's execution here (`Operation aborted`), while the
+  // earlier shape (`Wait aborted`) came from its polling loop. Both are this tool retiring the
+  // nested call after its own answer, so neither may be reported as a native failure.
+  const pi = fakePi();
+  const activate = await loadExtension();
+  activate(pi as never);
+  // The native tool has to be *registered* for the extension to attempt the nested call at all.
+  pi.tools.push({ name: "bg_wait", parameters: {}, execute: async () => ({}) });
+  const host = new FakeBackgroundTaskHost(pi.events, { sessionId: "sess-A" });
+  let aborted = false;
+  const ctx = fakeContext("sess-A", "C:/sessions/A.jsonl", "C:/work", async (name, _params, options) => {
+    assert.equal(name, "bg_wait");
+    const signal = options?.signal;
+    // Never answers on its own: only this tool's release ends it, so the native failure text is
+    // the one a real abort inside its execution produces.
+    // `ctx.executeTool` reports a tool failure as an outcome with `isError:true`, not by
+    // throwing (the throw path is the host's own dispatch failure). This is the shape the live
+    // session reported: `native bg_wait failed: Operation aborted`.
+    return await new Promise((resolve) => {
+      const answerAsAborted = (): void => {
+        aborted = true;
+        resolve({ isError: true, result: { content: [{ type: "text", text: "Operation aborted" }] } });
+      };
+      if (signal?.aborted === true) answerAsAborted();
+      else signal?.addEventListener("abort", answerAsAborted, { once: true });
+    });
+  });
+  await pi.emitTo("session_start", { reason: "startup" }, ctx);
+  host.upsert({ id: "bg-rel", name: "build", command: "npm run build", status: "running", startTime: 1, isAgent: false });
+  await tick(80);
+  const tool = pi.tools.find((entry) => entry.name === "bg_wait_unified");
+  assert.ok(tool);
+  const pending = tool.execute("call-rel", { all: true, timeoutMs: 3000 }, undefined, undefined, ctx) as Promise<unknown>;
+  await tick(60);
+  host.finish("bg-rel", "completed", { exitCode: 0 });
+  const result = (await pending) as { content: { text: string }[] };
+  const text = result.content[0]?.text ?? "";
+  assert.ok(aborted, "this tool must retire the nested call once it has its answer");
+  assert.match(text, /bg-rel completed/i);
+  assert.match(text, /released when this wait ended/i, "the abort is a release note");
+  assert.doesNotMatch(text, /Operation aborted/, "the native failure text is not reported");
+  assert.doesNotMatch(text, /nested call failed/i);
+});

@@ -230,6 +230,18 @@ in the tool's own `promptGuidelines`.
 * `tool_result` carries `details`, which is where `bg_run`/`bg_*` put `task`/`tasks`
   (`BgRunDetails`, `BgStatusDetails` in `pi-background-tasks` `common.ts:425-431`).
 * `ctx.executeTool(name, args, { signal })` for the optional nested native `bg_wait` call.
+* `ctx.hasPendingMessages()` (`agent-session.js:2932`, forwarded by
+  `core/extensions/runner.js:238`/`:683-686`) reports `pendingMessageCount > 0`, i.e. a steered or
+  follow-up custom message is queued. A steered message emits **no** `message_start`/
+  `message_end` until the agent loop drains the queue at a turn boundary
+  (`agent-session.js:1968-1974` `this.agent.steer(appMessage)`; the comment at `:1983-1988`
+  states that appending now would put a message between a tool call and its result). Both
+  facts together fix the boundary of the intercom-signal claim: an ask is observable through
+  pi-intercom's ledger, a subagent-routed notice through `subagent:control-intercom`, and a
+  plain `send` only after the turn ends.
+* `ctx.sendMessage(message, options)` (`agent-session.js:3734`) is what pi-intercom uses to
+  inject an inbound message (`pi-intercom/index.ts:1334-1341`); it never reaches the bus while
+  the wait holds the turn.
 * `pi.registerTool({ parameters })` validates JSON Schema; `typebox` is a Pi-aliased import
   (`docs/extensions.md` §Available Imports), available to extension code but **not** to
   code run outside Pi. The parameter schema therefore lives in the extension module

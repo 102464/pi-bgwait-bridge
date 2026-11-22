@@ -30,6 +30,20 @@ interface HarnessOptions {
   signalSetup?: (bus: FakeEventBus) => { signal: () => SubagentSignal | undefined; off: () => void };
   /** Live async runs of this session, as pi-subagents' own run records would report them. */
   activeRuns?: () => readonly { runId: string; activity: readonly string[] }[];
+  /**
+   * The nested native `bg_wait` call. Production always wires one (it is how the async-run
+   * scope is covered), and the empty-scope case behaves differently *with* it, so rows that
+   * exercise that shape must inject it.
+   */
+  nativeWait?: (
+    params: Record<string, unknown>,
+    signal: AbortSignal | undefined,
+    onUpdate: (() => void) | undefined,
+  ) => Promise<string>;
+  /** A disk-change wake source (OS notifications in production, injected here). */
+  externalWake?: (wake: () => void) => () => void;
+  /** Poll fallback interval; a high value makes a poll-driven pass impossible. */
+  pollIntervalMs?: number;
 }
 
 function harness(options: HarnessOptions = {}) {
@@ -49,6 +63,9 @@ function harness(options: HarnessOptions = {}) {
     ...(options.supervisor ? { hasSupervisorRequest: options.supervisor } : {}),
     ...(armed ? { pendingSubagentSignal: armed.signal } : {}),
     ...(options.activeRuns ? { activeRuns: options.activeRuns } : {}),
+    ...(options.nativeWait ? { nativeWait: options.nativeWait } : {}),
+    ...(options.externalWake ? { externalWake: options.externalWake } : {}),
+    ...(options.pollIntervalMs !== undefined ? { pollIntervalMs: options.pollIntervalMs } : {}),
     subscribe: (listener) => bridge.onChange(listener),
   });
   return { bus, host, bridge, runner, armed };
@@ -345,17 +362,110 @@ test("the progress line counts live async runs from the run records, in native w
   assert.ok(seen.length > 0, "progress updates must reach onUpdate");
   // Native shape (`asyncWaitUpdate`, subagent-wait.js:348-364): the headline carries the live
   // async-run count and the per-run `agent: tool` activity after a ` · ` separator.
-  assert.match(seen[0] ?? "", /^Waiting .+ for 2 async run\(s\) and 0 provider item\(s\)\. \u00b7 scout: bash \u00b7 rtl-engineer: edit \u00b7 bg-tick$/);
+  // One running background task, so native's `provider item(s)` count is 1 — the item count is a
+  // live measurement, not `preTerminal.length` (which folded finished records in and printed 0).
+  assert.match(seen[0] ?? "", /^Waiting .+ for 2 async run\(s\) and 1 provider item\(s\)\. \u00b7 scout: bash \u00b7 rtl-engineer: edit \u00b7 bg-tick$/);
   assert.match(result.text, /Wait window elapsed/i);
   h.bridge.dispose();
 });
 
+// ---- nothing live at all: the native answer is the whole answer --------------------------
+test("an idle session returns at once instead of holding an empty scope to the window", async () => {
+  // Reported by the operator: `bg_wait_unified({all:true, stopOnAttention:true,
+  // timeoutMs:1200000})` printed `Waiting 5m11s for 0 async run(s) and 0 provider item(s).`
+  // and came back only when the 20-minute window ran out, because the signal loop was kept
+  // alive for an empty scope with nothing in it to observe.
+  let nativeCalls = 0;
+  const h = harness({
+    activeRuns: () => [],
+    nativeWait: async () => {
+      nativeCalls += 1;
+      return "No active async runs or registered provider work in this session. Nothing to wait for.";
+    },
+  });
+  await h.bridge.refreshNow();
+  await until(() => h.bridge.owned() === true);
+  const startedAt = Date.now();
+  const result = await h.runner({ all: true, stopOnAttention: true, timeoutMs: 1_200_000 }, undefined, undefined, undefined);
+  const elapsed = Date.now() - startedAt;
+  assert.ok(elapsed < 5_000, `an idle session must answer at once, waited ${String(elapsed)}ms`);
+  assert.equal(nativeCalls, 1, "the native half is still asked, so its scope stays covered");
+  assert.match(result.text, /No background task of this session is running/i);
+  assert.match(result.text, /Nothing to wait for/i, "the native answer is passed through");
+  h.bridge.dispose();
+});
+
+// ---- disk signals wake the wait without polling -------------------------------------------
+test("a disk change wakes the wait even when the poll interval is longer than the whole wait", async () => {
+  // The two disk-backed signals (an intercom ask another agent is blocked on, a supervisor
+  // request file) never reach the bus while this tool holds the turn. The wait must be woken by
+  // the change itself, not by its own poll fallback: production watches those folders with
+  // `fs.watch` (`src/work-watch.ts`) and calls `wake`. Here the poll interval is 60 s while the
+  // test's whole window is 2 s, so a poll-driven pass cannot explain the result.
+  let signal: SubagentSignal | undefined;
+  let wake: (() => void) | undefined;
+  let disposed = 0;
+  const h = harness({
+    pollIntervalMs: 60_000,
+    signalSetup: () => ({ signal: () => signal, off: () => {} }),
+    externalWake: (next) => {
+      wake = next;
+      return () => {
+        disposed += 1;
+      };
+    },
+  });
+  await start(h, ["bg-disk"]);
+  const startedAt = Date.now();
+  const pending = h.runner({ all: true, timeoutMs: 2000 }, undefined, undefined, undefined);
+  await tick(120);
+  // A file landed: the caller's watch invalidates its probe cache and wakes the loop.
+  signal = { kind: "intercom_ask", runId: "ask-1", agent: "peer", messageId: "ask-1", question: "which arm?", source: "intercom-ask", observedAt: Date.now() };
+  wake?.();
+  const result = await pending;
+  const elapsed = Date.now() - startedAt;
+  assert.ok(elapsed < 1500, `the disk wake must end the wait, not the poll or the window (${String(elapsed)}ms)`);
+  assert.match(result.text, /which arm/i, "the ask body reaches the result");
+  assert.equal(disposed, 1, "the wake source is disposed exactly once when the wait settles");
+  h.bridge.dispose();
+});
+
+// ---- empty bg scope + async subagent: the native answer ends the wait ----------------------
+test("no background task but a live async subagent: the native answer ends the wait, not the window", async () => {
+  // The reported scenario (operator, 2026-11-22): a session whose only work is an async
+  // subagent, `bg_wait_unified({all:true, timeoutMs:2400000})`. Before the fix the tool's own
+  // loop ran beside the native half with an empty id scope, `isDone()` returned `undefined` for
+  // that scope by design (`wait-core.ts:157`), and the tool stayed blocked after the native half
+  // had already printed `done` — the same "ended, but the call did not come back" complaint.
+  const nativeAnswerMs = 300;
+  const h = harness({
+    activeRuns: () => [{ runId: "run-solo", activity: ["rtl-engineer: bash"] }],
+    nativeWait: async () =>
+      await new Promise<string>((resolve) => {
+        setTimeout(() => resolve("Native wait: Waited 3m12s for 1 async run(s); done."), nativeAnswerMs);
+      }),
+  });
+  const startedAt = Date.now();
+  const result = await h.runner({ all: true, timeoutMs: 60_000 }, undefined, undefined, undefined);
+  const waitedMs = Date.now() - startedAt;
+  // The window is 60 s; the native half answered at ~0.3 s. Riding out even a fraction of that
+  // gap is the bug, so the bound is generous but far below the window.
+  assert.ok(waitedMs < 15_000, `the wait must end with the native answer, waited ${String(waitedMs)}ms`);
+  assert.match(result.text, /No background task of this session is running/);
+  assert.match(result.text, /Waited 3m12s for 1 async run\(s\); done/);
+  h.bridge.dispose();
+});
 test("a session with no live async run reports 0 async run(s), never a made-up count", async () => {
-  const h = harness({ activeRuns: () => [] });
+  // Exactly the production wiring: `pendingSubagentSignal` IS present. Counting its existence
+  // (`deps.pendingSubagentSignal ? 1 : 0`) printed `+1` phantom async run on every real wait;
+  // the harness omitting it is what hid that. This row keeps the dep present.
+  const h = harness({ activeRuns: () => [], signalSetup: () => ({ signal: () => undefined, off: () => {} }) });
   await start(h, ["bg-zero"]);
   const seen: string[] = [];
   await h.runner({ all: true, timeoutMs: 1200 }, undefined, undefined, (update) => seen.push(update.text));
-  assert.match(seen[0] ?? "", /^Waiting .+ for 0 async run\(s\) and 0 provider item\(s\)\. \u00b7 bg-zero$/);
+  // `bg-zero` is running, so it is one provider item; what must never appear is a phantom
+  // async run from an existence test on `pendingSubagentSignal` (always wired in production).
+  assert.match(seen[0] ?? "", /^Waiting .+ for 0 async run\(s\) and 1 provider item\(s\)\. \u00b7 bg-zero$/);
   h.bridge.dispose();
 });
 

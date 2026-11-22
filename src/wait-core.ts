@@ -51,6 +51,16 @@ export interface WaitDeps {
   pendingSubagentSignal?: () => SubagentSignal | undefined;
   /** Wakes the loop on state change; returns an unsubscribe. */
   subscribe?: (listener: () => void) => () => void;
+  /**
+   * Wakes the loop on a change the bus never announces, and returns an unsubscribe.
+   *
+   * The two disk-backed signals — an intercom ask another agent is blocked on, a supervisor
+   * request file — have no Pi event behind them while a blocking tool holds the turn
+   * (`agent-session.js:1967-1975` only queues a steered message). The caller watches those
+   * folders with OS notifications and calls `wake` when one changes, so the wait ends at the
+   * signal instead of at the next poll tick. The poll stays as the fallback.
+   */
+  externalWake?: (wake: () => void) => () => void;
   /** Channels that should wake the loop. */
   wakeChannels?: readonly string[];
   /** Optional cap on consecutive no-op wakeups (defensive against event storms). */
@@ -71,6 +81,10 @@ export interface WaitRequest {
    * cannot see (an attention notice, an intercom message, a supervisor ask). Without it, an
    * `all:true` call in exactly the post-reload case the operator reported would sit on the
    * native half and never observe those signals.
+   *
+   * In `any` mode this flag also stops an empty id scope from counting as a first completion:
+   * with it the subagent half belongs to the native tool, and answering `any` here the moment
+   * the call starts would refuse to wait for a subagent at all.
    */
   holdEmptyScope?: boolean;
 }
@@ -116,6 +130,13 @@ export async function waitForWork(scope: WaitScope, request: WaitRequest, deps: 
     }
   }
   if (deps.subscribe) unsubscribers.push(deps.subscribe(wake));
+  if (deps.externalWake) {
+    try {
+      unsubscribers.push(deps.externalWake(wake));
+    } catch {
+      /* an unwatchable source only costs latency */
+    }
+  }
 
   const cleanup = () => {
     for (const unsubscribe of unsubscribers) {
@@ -150,7 +171,11 @@ export async function waitForWork(scope: WaitScope, request: WaitRequest, deps: 
       const done = finished();
       if (request.mode === "any") {
         if (done.length > 0) return { kind: "settled", reason: "any" };
-        if (initialIds.size === 0) return { kind: "settled", reason: "any" };
+        // An empty id scope is only "nothing to wait for" when this loop owns the whole
+        // scope. With `holdEmptyScope` the subagent half of a session-wide wait belongs to
+        // the native tool, so settling here would answer `any` instantly and abandon the one
+        // scope that still has work in it — the reported "any cannot wait for a subagent" bug.
+        if (initialIds.size === 0 && request.holdEmptyScope !== true) return { kind: "settled", reason: "any" };
         return undefined;
       }
       if (active.length === 0) {

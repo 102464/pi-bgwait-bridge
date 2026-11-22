@@ -14,7 +14,6 @@
  * Run: node scripts/live-e2e.mjs   (needs `pi` on PATH; ~90 s)
  */
 import { spawn } from "node:child_process";
-import assert from "node:assert/strict";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 
@@ -45,6 +44,7 @@ function runPi(timeoutMs = 240_000) {
     const child = spawn(command, args, {
       cwd: packageRoot,
       stdio: ["ignore", "pipe", "pipe"],
+      env: { ...process.env, PI_DEFERRED_TOOLS_CONFIG: path.join(packageRoot, "scripts", "live-dce-config.json") },
     });
     let stdout = "";
     let stderr = "";

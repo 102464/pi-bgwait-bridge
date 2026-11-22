@@ -61,6 +61,10 @@ export interface IntercomProbe {
   /** All unanswered asks, oldest first. */
   pendingAll(): readonly IntercomAsk[];
   root(): string;
+  /** The directory a change-watch must observe to learn about a new ask without polling. */
+  watchedDir(): string;
+  /** Forget the cached scan; the next `pending()` re-reads the ledger. */
+  invalidate(): void;
 }
 
 const MAX_ASK_FILES = 128;
@@ -90,6 +94,19 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function normalize(value: string): string {
   return value.replace(/\\/g, "/").replace(/\/+/g, "/").toLowerCase();
+}
+
+/**
+ * `asker` as one printable name. Decoding stays here, at the JSON boundary: the record is
+ * another process's file, so every field is narrowed before the wait loop ever sees it.
+ */
+function askerNameOf(value: unknown): string {
+  if (!isRecord(value)) return "another agent";
+  const name = value["name"];
+  if (typeof name === "string" && name.length > 0) return name;
+  const sessionId = value["sessionId"];
+  if (typeof sessionId === "string" && sessionId.length > 0) return sessionId;
+  return "another agent";
 }
 
 export function createIntercomProbe(options: IntercomProbeOptions): IntercomProbe {
@@ -132,14 +149,7 @@ export function createIntercomProbe(options: IntercomProbeOptions): IntercomProb
       if (createdAt === undefined || createdAt < notBefore) continue;
       const expiresAt = typeof parsed["expiresAt"] === "number" ? parsed["expiresAt"] : undefined;
       if (expiresAt !== undefined && expiresAt <= now()) continue; // answered, cancelled, or pruned
-      const asker = parsed["asker"];
-      const askerName = isRecord(asker)
-        ? typeof asker["name"] === "string" && asker["name"].length > 0
-          ? asker["name"]
-          : typeof asker["sessionId"] === "string"
-            ? asker["sessionId"]
-            : "another agent"
-        : "another agent";
+      const askerName = askerNameOf(parsed["asker"]);
       const question = typeof parsed["question"] === "string" ? parsed["question"] : "";
       asks.push({ messageId, asker: askerName, question, createdAt, expiresAt });
     }
@@ -158,5 +168,12 @@ export function createIntercomProbe(options: IntercomProbeOptions): IntercomProb
     pending: () => refresh()[0],
     pendingAll: () => refresh(),
     root: () => root,
+    /** Directory whose entries change when an ask is written or answered (`watchRoot`). */
+    watchedDir: () => root,
+    /** Drop the scan cache, so the next read reflects a change just seen on the wire. */
+    invalidate: () => {
+      cachedAt = -1;
+      cached = [];
+    },
   };
 }

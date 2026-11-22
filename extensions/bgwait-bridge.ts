@@ -27,6 +27,7 @@ import { registerProviderSync, upgradeToOfficial, type ProviderShape, type Regis
 import { createSubagentSignalCapture, type SubagentSignalCapture } from "../src/subagent-signals.ts";
 import { createUnifiedToolRunner } from "../src/unified-tool.ts";
 import { createSupervisorProbe } from "../src/supervisor-probe.ts";
+import { createWorkWatch } from "../src/work-watch.ts";
 import type { WaitTargetTask } from "../src/types.ts";
 
 /**
@@ -275,13 +276,25 @@ export default function activate(pi: ExtensionAPI): void {
          * turn (`agent-session.js:1967-1975` only queues it), so the ledger record is the
          * only evidence a wait can see.
          */
-        pendingAsk: () => {
-          const ids = [process.env["PI_INTERCOM_SESSION_ID"], runtime.identity.sessionId].filter(
-            (value): value is string => typeof value === "string" && value.length > 0,
-          );
-          return createIntercomProbe({ sessionIds: () => ids }).pending();
-        },
+        pendingAsk: () => intercom.pending(),
       });
+      /**
+       * One probe per call, so its own 250 ms scan cache is reused across the wait's ticks.
+       * pi-intercom addresses a session by its intercom id (`resolveConfiguredIntercomSessionId`,
+       * index.ts:596-598), which it publishes into `PI_INTERCOM_SESSION_ID` at session start —
+       * read lazily because the extension loads before that.
+       */
+      const intercomIds = (): string[] =>
+        [process.env["PI_INTERCOM_SESSION_ID"], runtime.identity.sessionId].filter(
+          (value): value is string => typeof value === "string" && value.length > 0,
+        );
+      const intercom = createIntercomProbe({ sessionIds: intercomIds });
+      /**
+       * The disk half of the wait's signals arrives as an OS change notification, not a poll
+       * tick (operator request, 2026-11-22). A steered intercom ask and a supervisor request
+       * both live only in a file while this tool holds the turn, so the folders pi-intercom and
+       * pi-subagents write are watched; the wait loop's own poll stays as the fallback.
+       */
       let armed: (() => void) | undefined;
       try {
         // Armed before the wait begins and cleared in `finally`: a notice that fired before
@@ -306,17 +319,53 @@ export default function activate(pi: ExtensionAPI): void {
           // `0 async run(s)` while a subagent of this session is plainly still working.
           activeRuns: () => signals.activeRuns(),
           subscribe: (listener) => runtime.bridge.onChange(listener),
+          /**
+           * The disk half of the wait's signals arrives as an OS change notification instead of
+           * a poll tick. `supervisor` and `intercom` are the probes that answer the two
+           * predicates, and their folders are exactly where a request/ask/reply file lands —
+           * so a change there invalidates the cached verdicts and wakes the loop at once. The
+           * loop's own poll stays as the fallback for an unwatchable path.
+           */
+          externalWake: (wake) => {
+            const watch = createWorkWatch({
+              dirs: () => [intercom.watchedDir(), ...supervisor.watchedDirs()],
+              onChange: () => {
+                intercom.invalidate();
+                supervisor.invalidate();
+                wake();
+              },
+            });
+            return watch.start();
+          },
           nativeWait: async (waitParams, nestedSignal) => {
             if (!pi.getAllTools().some((tool) => tool.name === "bg_wait")) {
               return "native bg_wait is not registered in this session; skipped.";
             }
+            /**
+             * `ctx.executeTool` resolves against the *active* tool set, and this workspace runs
+             * `pi-deferred-context-engine`: `bg_wait` is deferred by default, so the nested call
+             * came back `native bg_wait failed: Tool bg_wait not found` and the async-run scope
+             * was silently dropped. Registering the tool is not enough — it has to be active for
+             * this run, so it is activated immediately before the call (the same promotion the
+             * model gets from `search_tools`, done here because this call is not model-issued).
+             */
+            const active = pi.getActiveTools();
+            if (!active.includes("bg_wait")) pi.setActiveTools([...active, "bg_wait"]);
             const outcome = await ctx.executeTool("bg_wait", waitParams, { signal: nestedSignal });
             const text = textOf(outcome);
             // The native tool can be blocked or disabled; its no-work answer must not be
             // reported as a completed subagent wait. An abort this tool caused by returning
             // its own answer is not a failure: the async scope simply keeps running.
             if ((outcome as { isError?: boolean } | undefined)?.isError === true) {
-              if (nestedSignal?.aborted === true && /^\s*Wait aborted/i.test(text)) {
+              /**
+               * Aborting the nested call is how this tool retires the native half after it has
+               * already answered, and the native failure text depends on where it was cut off:
+               * `Wait aborted` when it was still polling, `Operation aborted` when the abort
+               * landed inside its own tool execution. Both are this tool's own release, not a
+               * failure of the async-run scope, so the abort itself decides the wording — a
+               * genuine native failure cannot coincide with an abort we issued.
+               */
+              if (nestedSignal?.aborted === true) {
                 return "native bg_wait released when this wait ended, so the async-run scope keeps running.";
               }
               return `native bg_wait failed: ${text}`;

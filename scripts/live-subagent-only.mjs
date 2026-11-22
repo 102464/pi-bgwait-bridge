@@ -32,7 +32,17 @@ function runPi(timeoutMs = 300_000) {
       ? ["-e", "./scripts/live-subagent-only-probe.ts"]
       : ["-e", ".", "-e", "./scripts/live-subagent-only-probe.ts"];
     const { command, args } = piCommand(["-p", PROMPT, ...extensionArgs, "--no-session"]);
-    const child = spawn(command, args, { cwd: packageRoot, stdio: ["ignore", "pipe", "pipe"] });
+    /**
+     * DCE (`pi-deferred-context-engine`) is enabled in this workspace: a deferred tool is refused
+     * both from the model and from `executeTool` ("Tool <name> not found"). A scripted scenario
+     * cannot promote anything, so the session starts against a config copy that pins the tools
+     * this harness uses (`scripts/live-dce-config.json`, derived from the user's config).
+     */
+    const child = spawn(command, args, {
+      cwd: packageRoot,
+      stdio: ["ignore", "pipe", "pipe"],
+      env: { ...process.env, PI_DEFERRED_TOOLS_CONFIG: path.join(packageRoot, "scripts", "live-dce-config.json") },
+    });
     let stdout = "";
     let stderr = "";
     const timer = setTimeout(() => {

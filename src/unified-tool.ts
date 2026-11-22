@@ -72,6 +72,10 @@ export interface UnifiedToolDeps {
   activeRuns?: () => readonly ActiveSubagentRun[];
   /** Subscribe to local state changes (bridge.onChange). */
   subscribe?: (listener: () => void) => () => void;
+  /** Wake the loop on a disk signal (intercom ledger, supervisor request files). */
+  externalWake?: (wake: () => void) => () => void;
+  /** Poll fallback interval; a test sets it high to prove a wake does not come from a tick. */
+  pollIntervalMs?: number;
   /**
    * Called on every wait tick with a `mutating` flag that turns true exactly once per wait.
    *
@@ -241,7 +245,7 @@ export function createUnifiedToolRunner(deps: UnifiedToolDeps) {
     let lastUpdateAt = -UPDATE_INTERVAL_MS;
     let lastUpdateText = "";
     let mutated = false;
-    const emitSignalProgress = (elapsedMs: number, providerItems: number, ownIds: number): void => {
+    const emitSignalProgress = (elapsedMs: number, providerItems: number): void => {
       // A live scenario may need to act *during* this wait (route an intercom ask, write a
       // supervisor request file). This hook runs on every tick, so it is where such an action
       // is scheduled; `mutating` is true once per wait.
@@ -249,9 +253,13 @@ export function createUnifiedToolRunner(deps: UnifiedToolDeps) {
       mutated = true;
       if (onUpdate !== undefined && elapsedMs - lastUpdateAt >= UPDATE_INTERVAL_MS) {
         const runs = deps.activeRuns?.() ?? [];
-        const signalCount = deps.pendingSubagentSignal ? 1 : 0;
+        // Native wording, same nouns: `async run(s)` are async subagent runs only, and
+        // `provider item(s)` are background tasks still running (subagent-wait.js:348-364).
+        // Both are measured live — never an existence test (`deps.pendingSubagentSignal` is
+        // always wired in production, so counting it printed a phantom run) and never a
+        // fold of finished records into the run count.
         const parts = [
-          `Waiting ${formatDuration(elapsedMs)} for ${String(runs.length + ownIds + signalCount)} async run(s) and ${String(providerItems)} provider item(s).`,
+          `Waiting ${formatDuration(elapsedMs)} for ${String(runs.length)} async run(s) and ${String(providerItems)} provider item(s).`,
           ...runs.flatMap((run) => [...run.activity]),
           ...[...activeIdRef.value],
         ].filter((part) => part.length > 0);
@@ -276,6 +284,13 @@ export function createUnifiedToolRunner(deps: UnifiedToolDeps) {
     );
     const unknownIds = selection.ids.filter((id) => !knownActive.has(id) && !preTerminal.some((record) => record.id === id));
     activeIdRef.value = activeIds;
+    /**
+     * Background tasks native `bg_wait` counts as `provider item(s)`: the running items of
+     * this scope, live. Finished records are never folded in, and an exact-id wait counts
+     * only the ids it covers.
+     */
+    const providerItemCount = (): number =>
+      input.ids !== undefined && input.ids.length > 0 ? activeIdRef.value.length : bridge.running().length;
 
     // Already-terminal selection: answer immediately, exactly like native bg_wait does for a
     // finished run. `all` still needs the rest; `any` is already satisfied.
@@ -308,7 +323,23 @@ export function createUnifiedToolRunner(deps: UnifiedToolDeps) {
         // would sit on the native half and never notice any of them.
         startNative();
         const emptyStartedAt = now();
-        const emptyOutcome = await waitForWork({ taskIds: [] }, { mode, timeoutMs, signal, userInputSignal, onTick: ({ elapsedMs }) => { emitSignalProgress(elapsedMs, 0, 0); }, holdEmptyScope: true }, {
+        /**
+         * The signal loop is kept alive only *while* there is something to observe, and the
+         * native half's own answer ends it.
+         *
+         * Without this the loop rode out the whole window: `isDone()` returns `undefined`
+         * whenever the id set is empty (`wait-core.ts:157`), so in the reported case (one
+         * async subagent, no background task) the native half printed
+         * `Waited 3m12s for 1 async run(s); done` and the tool stayed blocked until the
+         * 40-minute window expired. The async scope native covers is settled the moment it
+         * answers, so that answer is this loop's terminal condition.
+         */
+        const emptyLifetime = new AbortController();
+        const forwardAbort = (): void => emptyLifetime.abort();
+        if (signal?.aborted === true) forwardAbort();
+        else signal?.addEventListener("abort", forwardAbort, { once: true });
+        let nativeAnsweredFirst = false;
+        const emptyLoop = waitForWork({ taskIds: [] }, { mode, timeoutMs, signal: emptyLifetime.signal, userInputSignal, onTick: ({ elapsedMs }) => { emitSignalProgress(elapsedMs, 0); }, holdEmptyScope: true }, {
           events: deps.events,
           now: deps.now,
           activeIds: () => bridge.running().map((task) => task.id),
@@ -317,18 +348,59 @@ export function createUnifiedToolRunner(deps: UnifiedToolDeps) {
           ...(deps.hasSupervisorRequest ? { hasSupervisorRequest: deps.hasSupervisorRequest } : {}),
           ...(deps.pendingSubagentSignal ? { pendingSubagentSignal: deps.pendingSubagentSignal } : {}),
           ...(deps.subscribe ? { subscribe: deps.subscribe } : {}),
+          ...(deps.externalWake ? { externalWake: deps.externalWake } : {}),
+          ...(deps.pollIntervalMs !== undefined ? { pollIntervalMs: deps.pollIntervalMs } : {}),
           wakeChannels: SIGNAL_CHANNELS,
         });
+        const emptyOutcome = await Promise.race([
+          emptyLoop,
+          // `nativePending` resolves with the native half's text, success or failure: either
+          // way its scope is settled, so this loop has no further work to observe.
+          (nativePending ?? Promise.resolve()).then((): "native" => "native"),
+        ]);
+        /**
+         * Only a *settled* answer from the native half ends this loop: `; done`, `Nothing to
+         * wait for`, or its own release note. Its window running out (`…; timeout`) does not —
+         * that answer carries no information about the work, and treating it as terminal would
+         * drop the signal this loop exists to observe (the row that caught it had native answer
+         * `timeout` at once while the attention notice arrived 60 ms later).
+         *
+         * This is also what fixes the operator's idle-session report: `all:true` in a session
+         * with no work used to print `Waiting 5m11s for 0 async run(s) and 0 provider item(s).`
+         * because an empty id scope is never "done" by state (`wait-core.ts:157`). Native
+         * `bg_wait` answers that session with `Nothing to wait for` at once, and that answer is
+         * settled, so the loop now ends with it instead of riding out a 20-minute window.
+         */
+        const nativeSaysDone = isDoneAnswer(nativeNote);
+        if (emptyOutcome === "native" && nativeSaysDone) {
+          nativeAnsweredFirst = true;
+          emptyLifetime.abort(); // wakes the loop; its outcome is then discarded below
+        }
+        const loopOutcome = emptyOutcome === "native" ? await emptyLoop : emptyOutcome;
+        signal?.removeEventListener("abort", forwardAbort);
         abortNative();
         if (nativePending) await nativePending;
-        if (emptyOutcome.kind === "subagent_signal" || emptyOutcome.kind === "supervisor_request") {
+        if (!nativeAnsweredFirst && (loopOutcome.kind === "aborted" || loopOutcome.kind === "timeout")) {
+          // The loop ended on its own (tool abort or window): report that, not the native text.
+          return {
+            text: joinNotes("No background task of this session is running.", nativeNote || "Native wait returned no text."),
+            failed: loopOutcome.kind === "aborted",
+            failedIds: [],
+          };
+        }
+        /**
+         * A signal ends the wait even when the native half already answered `timeout`: the
+         * operator's requirement is that attention / intercom / supervisor ends the wait,
+         * and native's window expiring carries no information about the work.
+         */
+        if (!nativeAnsweredFirst && (loopOutcome.kind === "subagent_signal" || loopOutcome.kind === "supervisor_request")) {
           const ended = summarise({
             mode,
             elapsedMs: now() - emptyStartedAt,
             ids: [],
             terminal,
             preTerminal,
-            outcome: emptyOutcome,
+            outcome: loopOutcome,
             missing: selection.missing,
             failed: false,
             failedIds: [],
@@ -369,7 +441,7 @@ export function createUnifiedToolRunner(deps: UnifiedToolDeps) {
         signal,
         userInputSignal,
         onTick: ({ elapsedMs }) => {
-          emitSignalProgress(elapsedMs, selection.preTerminal.length, 0);
+          emitSignalProgress(elapsedMs, providerItemCount());
         },
       },
       {
@@ -381,6 +453,8 @@ export function createUnifiedToolRunner(deps: UnifiedToolDeps) {
         ...(deps.hasSupervisorRequest ? { hasSupervisorRequest: deps.hasSupervisorRequest } : {}),
         ...(deps.pendingSubagentSignal ? { pendingSubagentSignal: deps.pendingSubagentSignal } : {}),
         ...(deps.subscribe ? { subscribe: deps.subscribe } : {}),
+        ...(deps.externalWake ? { externalWake: deps.externalWake } : {}),
+        ...(deps.pollIntervalMs !== undefined ? { pollIntervalMs: deps.pollIntervalMs } : {}),
         wakeChannels: SIGNAL_CHANNELS,
       },
     );
@@ -438,6 +512,36 @@ interface SummariseInput {
   failedIds: readonly string[];
   nativeNote?: string;
   coordinationLines?: readonly string[];
+}
+
+/**
+ * Whether the nested native `bg_wait` answer means "the async scope is settled".
+ *
+ * Native prints `Waited <duration> for N async run(s) and M provider item(s); done` when the
+ * wait settled, and `; timeout` / `; aborted` when its own window or an abort ended it. Only
+ * the settled form may end the unified wait's empty-scope loop: a `timeout` carries no
+ * information about the work, and the loop still has three signals to observe.
+ */
+function isDoneAnswer(nativeText: string): boolean {
+  const text = nativeText.trim();
+  /**
+   * The native tool's settled wordings, each captured from a real session:
+   *   all   → `Waited 37m1s for 1 async run(s); done. Outcome: 1 complete.`
+   *   any   → `Waited 22.1s; 1 of 1 run(s) finished. Outcome: 1 complete.` / `No runs remain in flight.`
+   *   idle  → `No active async runs or registered provider work in this session. Nothing to wait for.`
+   *   release → `… released when this wait ended, so the async-run scope keeps running.`
+   *
+   * A `;`-suffix heuristic is not enough: the any-mode answer ends with a trailing advisory
+   * (`…observed; inspect status if a notification is not visible yet.`), so the last `;` is not
+   * the outcome marker and the loop rode out its whole window after the subagent had finished.
+   */
+  if (/nothing to wait for/i.test(text)) return true;
+  if (/released when this wait ended/i.test(text)) return true;
+  if (/;\s*done\b/i.test(text)) return true;
+  if (/\d+\s+of\s+\d+\s+run\(s\)\s+finished/i.test(text)) return true;
+  if (/no runs remain in flight/i.test(text)) return true;
+  // `; timeout`, `Wait window elapsed …` and `still active` carry no information about the work.
+  return false;
 }
 
 function joinNotes(primary: string, secondary: string): string {

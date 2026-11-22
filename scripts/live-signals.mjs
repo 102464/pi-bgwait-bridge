@@ -28,8 +28,33 @@ const packageRoot = path.resolve(here, "..");
 const SUPERVISOR_TASK =
   "Call contact_supervisor exactly once with reason \"need_decision\" and the message \"which arm should I take for the next RTL batch?\". Then stop and wait for the reply. After the reply arrives, reply with exactly SIGNALS_OK.";
 
+/**
+ * Holds the wait open with real work: a subagent that sleeps for a minute. It trips no
+ * attention path (the tool-open threshold upstream is 240 s), so the only signal in the wait
+ * is the intercom ask the probe schedules.
+ */
+const INTERCOM_HOLDER_TASK =
+  "Run exactly one bash command that sleeps for 60 seconds (ping -n 61 127.0.0.1 > nul on Windows). Then reply with exactly SIGNALS_OK.";
+
 const ATTENTION_TASK =
   "First use the bash tool three times with a command that must fail: echo x > C:/Users/ldl/AppData/Local/Temp/bgw-attn-missing-dir/f.txt. Each write must fail with a non-zero exit code. Then run one command that sleeps: ping -n 26 127.0.0.1 > nul. Then reply with exactly SIGNALS_OK.";
+
+/**
+ * Failing-tool run shaped for deterministic escalation: pi-subagents counts *consecutive* mutating
+ * failures (`failedToolAttemptsBeforeAttention`), and parallel calls inside one assistant message
+ * do not always count as separate attempts, so each failing call is given its own message.
+ */
+const ATTENTION_TASK_SEQUENTIAL =
+  "Call the bash tool once with a command that must fail: echo x > C:/Users/ldl/AppData/Local/Temp/bgw-attn-missing-dir/f.txt . Wait for the result, then repeat that exact same failing call twice more, one bash call per message. After the third failure, run one bash command that sleeps: ping -n 26 127.0.0.1 > nul. Then reply with exactly SIGNALS_OK.";
+
+/**
+ * The same failing-tool run, but launched with `notifyChannels: ["async","intercom"]` — no
+ * `event` channel. pi-subagents then writes its control record with `channels` lacking `event`
+ * (`subagent-runner.js:2440-2457`), so `deliverControlRecord` skips `subagent:control-event`
+ * (`async-job-tracker.js:205-215`) and emits **only** `subagent:control-intercom`. Nothing can
+ * shadow the intercom path, so a wait that ends here ended on the intercom channel itself.
+ */
+const INTERCOM_ONLY_CONTROL = { failedToolAttemptsBeforeAttention: 1, notifyChannels: ["async", "intercom"] };
 function piCommand(args) {
   const launcher =
     process.env["PI_LAUNCHER"] ??
@@ -44,7 +69,20 @@ function runRpc(prompt, { timeoutMs = 300_000 } = {}) {
       ? ["-e", "./scripts/live-signals-probe.ts"]
       : ["-e", ".", "-e", "./scripts/live-signals-probe.ts"];
     const { command, args } = piCommand(["--mode", "rpc", ...extensionArgs, "--no-session"]);
-    const child = spawn(command, args, { cwd: packageRoot, stdio: ["pipe", "pipe", "pipe"] });
+    /**
+     * This workspace runs `pi-deferred-context-engine` (DCE), which defers every tool that is not
+     * declared active and refuses a deferred tool both from the model and from `executeTool`
+     * ("Tool <name> not found"). A scripted scenario has to pin the two tools it uses, so the
+     * session is started against a config copy with `bg_wait_unified` and `live_signals_probe`
+     * in `alwaysActive`/`neverDefer` (`scripts/live-dce-config.json`, derived from the user's own
+     * config so nothing else changes). Without DCE installed this variable is simply ignored.
+     */
+    const dceConfig = path.join(packageRoot, "scripts", "live-dce-config.json");
+    const child = spawn(command, args, {
+      cwd: packageRoot,
+      stdio: ["pipe", "pipe", "pipe"],
+      env: { ...process.env, PI_DEFERRED_TOOLS_CONFIG: dceConfig },
+    });
     let stdout = "";
     let stderr = "";
     let settled = false;
@@ -95,6 +133,13 @@ function parseEvidence(stderr, prefix) {
   return evidence;
 }
 
+/** The line that states why the wait ended (`Wait ended after … because …`). */
+function verdictLine(text) {
+  return text
+    .split(/\r?\n/)
+    .find((line) => line.startsWith("Wait ended") || line.startsWith("Wait aborted")) ?? "";
+}
+
 function unquote(value) {
   if (value === undefined) return undefined;
   try {
@@ -130,14 +175,21 @@ async function scenario(name, prompt, { prefix = "live-signals", checks }) {
 }
 
 async function main() {
-  const scenarios = (process.env["LIVE_SIGNALS_SCENARIOS"] ?? "intercom,attention,supervisor").split(",");
+  const scenarios = (process.env["LIVE_SIGNALS_SCENARIOS"] ?? "intercom,intercom-control,attention,supervisor,idle,any-subagent").split(",");
   const results = [];
 
   if (scenarios.includes("intercom")) {
+    // A live async subagent keeps the wait genuinely open, so the ask that lands 5 s later is
+    // arriving *during* a wait over real work rather than into an idle session — an idle
+    // session correctly answers "nothing to wait for" at once (see the `idle` scenario).
     results.push(
       await scenario(
         "intercom ask routed from another process",
-        "Make exactly one tool call in this response: live_signals_probe with {\"scenario\":\"intercom-ask\",\"timeoutMs\":90000,\"askDelayMs\":5000}. Then reply with exactly SIGNALS_DONE.",
+        `Make exactly two tool calls in this response: (1) subagent with ${JSON.stringify({
+          agent: "scout",
+          task: INTERCOM_HOLDER_TASK,
+          async: true,
+        })}, and (2) live_signals_probe with {"scenario":"intercom-ask","timeoutMs":90000,"askDelayMs":5000}. Then reply with exactly SIGNALS_DONE.`,
         {
           checks: ({ unified, waitedMs, timeoutMs }) => [
             ["pi reported hasUI", undefined],
@@ -150,6 +202,72 @@ async function main() {
               "the text names the intercom ask",
               /waiting for a reply over intercom|Intercom ask|intercom message/i.test(unified),
               unified.replace(/\n/g, " | ").slice(0, 260),
+            ],
+          ],
+        },
+      ),
+    );
+  }
+
+  if (scenarios.includes("intercom-control")) {
+    // Real path, nothing forged: pi-subagents' own `subagent:control-intercom` event for an
+    // owned run, with the `event` channel withheld so it is the only signal in the wait.
+    results.push(
+      await scenario(
+        "subagent control-intercom message (event channel withheld)",
+        `Make exactly two tool calls in this response: (1) subagent with ${JSON.stringify({
+          agent: "scout",
+          task: ATTENTION_TASK_SEQUENTIAL,
+          async: true,
+          control: INTERCOM_ONLY_CONTROL,
+        })}, and (2) live_signals_probe with {"scenario":"generic","timeoutMs":120000}. Then reply with exactly SIGNALS_DONE.`,
+        {
+          checks: ({ unified, waitedMs, timeoutMs }) => [
+            [
+              "the wait ended on the intercom signal, not on its window",
+              waitedMs > 0 && timeoutMs > 0 && waitedMs < timeoutMs,
+              `waited=${String(waitedMs)}ms timeout=${String(timeoutMs)}ms`,
+            ],
+            [
+              "the text reports an intercom message from the run",
+              /sent an intercom message in run \S+/i.test(unified),
+              unified.replace(/\n/g, " | ").slice(0, 300),
+            ],
+            [
+              "the attention channel was not the trigger (it was withheld)",
+              // Only the *verdict* line decides the signal class; the routed intercom notice
+              // below it quotes upstream's own "needs attention" copy by design.
+              !/because \S+ needs attention in run/i.test(verdictLine(unified)),
+              verdictLine(unified).slice(0, 300),
+            ],
+          ],
+        },
+      ),
+    );
+  }
+
+  if (scenarios.includes("idle")) {
+    // The operator's own reproduction (2026-11-22): `bg_wait_unified({all:true,
+    // stopOnAttention:true, timeoutMs:1200000})` in a session with no work at all printed
+    // `Waiting 5m11s for 0 async run(s) and 0 provider item(s).` and returned only when the
+    // window ran out. Native `bg_wait` answers that session immediately, so the unified wait
+    // must too: a 20-minute window with nothing in it is not a wait, it is a hang.
+    results.push(
+      await scenario(
+        "idle session, 20-minute window",
+        'Make exactly one tool call: live_signals_probe with {"scenario":"idle","timeoutMs":1200000,"stopOnAttention":true}. Then reply with exactly SIGNALS_DONE.',
+        {
+          checks: ({ unified, waitedMs, timeoutMs }) => [
+            [
+              "an idle session answers at once instead of riding out the window",
+              waitedMs > 0 && waitedMs < 30_000,
+              `waited=${String(waitedMs)}ms timeout=${String(timeoutMs)}ms`,
+            ],
+            [
+              "the text states there is nothing to wait for",
+              /nothing to wait for|no background task/i.test(unified),
+              unified.replace(/\n/g, " | ").slice(0, 260),
+
             ],
           ],
         },
@@ -177,6 +295,40 @@ async function main() {
               "the text names the run and the agent",
               /needs attention in run/i.test(unified),
               unified.replace(/\n/g, " | ").slice(0, 260),
+            ],
+          ],
+        },
+      ),
+    );
+  }
+
+  if (scenarios.includes("any-subagent")) {
+    // Reported by the operator (`any=true`): with no background task of its own and one async
+    // subagent live, the call answered at once and reported a native failure it had itself
+    // caused. `any` must wait for the subagent half exactly like `all` does.
+    results.push(
+      await scenario(
+        "any:true with only a subagent",
+        `Make exactly two tool calls in this response: (1) subagent with ${JSON.stringify({
+          agent: "scout",
+          task: "Reply with exactly SCOUT_OK and stop.",
+          async: true,
+        })}, and (2) live_signals_probe with {"scenario":"any","timeoutMs":120000}. Then reply with exactly SIGNALS_DONE.`,
+        {
+          checks: ({ unified, waitedMs, timeoutMs }) => [
+            [
+              "the `any` wait covered the subagent instead of returning at once",
+              waitedMs > 1000 && timeoutMs > 0 && waitedMs < timeoutMs,
+              `waited=${String(waitedMs)}ms timeout=${String(timeoutMs)}ms`,
+            ],
+            [
+              "the text carries the native answer, not a self-inflicted native failure",
+              // Native's settled wordings differ per mode: `all` says `... async run(s) ...`,
+              // `any` says `N of M run(s) finished`. What must never appear is a native failure
+              // this tool itself caused, or a missing-tool answer.
+              !/nested call failed|Operation aborted|Tool bg_wait not found/i.test(unified) &&
+                /async run\(s\)|run\(s\) finished|Nothing to wait for/i.test(unified),
+              unified.split(String.fromCharCode(10)).join(" | ").slice(0, 300),
             ],
           ],
         },

@@ -36,6 +36,7 @@ function runPi(timeoutMs = 600_000) {
     const child = spawn(command, args, {
       cwd: packageRoot,
       stdio: ["ignore", "pipe", "pipe"],
+      env: { ...process.env, PI_DEFERRED_TOOLS_CONFIG: path.join(packageRoot, "scripts", "live-dce-config.json") },
     });
     let stdout = "";
     let stderr = "";

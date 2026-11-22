@@ -33,6 +33,10 @@ export interface SupervisorProbe {
   /** Pending request ids, for tool output. */
   pendingIds(): string[];
   root(): string;
+  /** Channel dirs a change-watch observes: request and reply files land there. */
+  watchedDirs(): readonly string[];
+  /** Forget cached verdicts; the next `hasPending()` re-reads the channel dirs. */
+  invalidate(): void;
 }
 
 const MAX_CHANNEL_DIRS = 64;
@@ -154,9 +158,39 @@ export function createSupervisorProbe(options: SupervisorProbeOptions): Supervis
     return cachedIds;
   }
 
+  /** Channel dirs whose contents change when a request is written, answered, or removed. */
+  const watchedDirs = (): readonly string[] => {
+    const dirs: string[] = [];
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(root, { withFileTypes: true });
+    } catch {
+      return dirs; // no channel root yet: nothing to watch, the poll fallback still covers it
+    }
+    let scanned = 0;
+    for (const entry of entries) {
+      if (!entry.isDirectory() || scanned >= MAX_CHANNEL_DIRS) continue;
+      scanned += 1;
+      const requests = path.join(root, entry.name, "requests");
+      const replies = path.join(root, entry.name, "replies");
+      for (const dir of [requests, replies]) {
+        try {
+          if (fs.statSync(dir).isDirectory()) dirs.push(dir);
+        } catch {
+          // not created yet: a request cannot exist there either
+        }
+      }
+    }
+    return dirs;
+  };
   return {
     hasPending: () => refresh().length > 0,
     pendingIds: () => refresh(),
     root: () => root,
+    watchedDirs,
+    invalidate: () => {
+      cachedAt = -1;
+      cachedIds = [];
+    },
   };
 }

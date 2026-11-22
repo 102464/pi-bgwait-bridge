@@ -80,6 +80,26 @@ export interface ActiveSubagentRun {
   /** `agent: currentTool` lines for the run's active steps, the same shape native prints. */
   activity: readonly string[];
 }
+/**
+ * One async run of this session, as its own `status.json` reports it — active or finished.
+ *
+ * Native `bg_wait` resolves `{id}` against exactly one subagent run (`subagent-wait.js:151-152`
+ * filters `run.runId === id || run.runId.startsWith(id)`; `:543` forces `waitForAll`; `:559`
+ * drops provider items). This is the same lookup against the same files, so `bg_wait_unified`
+ * can wait on one subagent run by id instead of reporting it as an unknown background task.
+ */
+export interface SubagentRunStatus {
+  runId: string;
+  /** `queued|running|complete|failed|killed|cancelled`, verbatim from `status.json`. */
+  state: string;
+  /** True while the state is one pi-subagents itself still waits on (`ACTIVE_STATES`, `:53`). */
+  active: boolean;
+  /** `agent: currentTool` lines of the run's active steps, in native `asyncWaitUpdate` shape. */
+  activity: readonly string[];
+  /** Where pi-subagents wrote the run's output, when `status.json` names it. */
+  outputFile?: string | undefined;
+  updatedAt?: number | undefined;
+}
 export interface SubagentSignalCaptureOptions {
   events: EventBusLike;
   /** This session's accepted identities (runtime id and/or session file). */
@@ -104,6 +124,13 @@ export interface SubagentSignalCapture {
   all(): readonly SubagentSignal[];
   /** Live async runs of this session, read from pi-subagents' own run records. */
   activeRuns(): readonly ActiveSubagentRun[];
+  /** Live async run ids, for `bg_wait_unified`'s exact-id scope. */
+  activeRunIds(): readonly string[];
+  /**
+   * One run of this session by exact id or unique prefix, active or already finished.
+   * `undefined` means this session has no such run (never launched here, or pruned).
+   */
+  status(runId: string): SubagentRunStatus | undefined;
   /** True while the capture is observing. */
   armed(): boolean;
   /**
@@ -138,6 +165,72 @@ export function createSubagentSignalCapture(options: SubagentSignalCaptureOption
   /** Active states, from pi-subagents' own `ACTIVE_STATES` (subagent-wait.js:53). */
   const ACTIVE_RUN_STATES = new Set(["queued", "running"]);
   const MAX_RUN_DIRS = 64;
+  /**
+   * pi-subagents' own live-run index: `async-subagent-runs/.active-runs/` holds one empty
+   * marker file per queued/running run, plus `tool-calls/<toolCallId>/<runId>` aliases
+   * (`bundle/chunk-DHY5TY2Y.js` `updateActiveRunIndex`). It is the authoritative live set.
+   *
+   * Reading it first is what fixes the reported `0 async run(s)` while a subagent was plainly
+   * working: this folder accumulates every run ever launched (326 directories on the reporting
+   * machine), so a bounded directory scan stopped at `MAX_RUN_DIRS` long before it reached the
+   * three live ones — all of them beyond name-sorted index 64. The index never has more than a
+   * handful of entries, so it cannot be truncated the same way.
+   */
+  const ACTIVE_RUN_INDEX_DIR = ".active-runs";
+  const TOOL_CALL_ALIAS_DIR = "tool-calls";
+  const MAX_ACTIVE_MARKERS = 512;
+  /** A run folder name only: the marker file's name *is* the folder name. */
+  function isSafeRunId(name: string): boolean {
+    return name.length > 0 && name.length <= 128 && !name.includes("/") && !name.includes("\\") && name !== "." && name !== "..";
+  }
+  /** Live run ids from pi-subagents' index (direct markers first, then tool-call aliases). */
+  function readActiveRunIndex(): string[] {
+    const ids: string[] = [];
+    const indexRoot = path.join(runsRoot, ACTIVE_RUN_INDEX_DIR);
+    try {
+      for (const entry of fs.readdirSync(indexRoot, { withFileTypes: true })) {
+        if (!entry.isFile() || !isSafeRunId(entry.name) || ids.length >= MAX_ACTIVE_MARKERS) continue;
+        ids.push(entry.name);
+      }
+    } catch {
+      return []; // No index: an older pi-subagents, or nothing ever launched from here.
+    }
+    const aliases = path.join(indexRoot, TOOL_CALL_ALIAS_DIR);
+    try {
+      for (const entry of fs.readdirSync(aliases, { withFileTypes: true })) {
+        if (!entry.isDirectory() || ids.length >= MAX_ACTIVE_MARKERS) continue;
+        for (const name of fs.readdirSync(path.join(aliases, entry.name))) {
+          if (ids.length >= MAX_ACTIVE_MARKERS) break;
+          if (isSafeRunId(name)) ids.push(name);
+        }
+      }
+    } catch {
+      /* aliases are a convenience; the direct markers already name the runs */
+    }
+    return [...new Set(ids)].sort((a, b) => a.localeCompare(b));
+  }
+  /**
+   * Run folder names to inspect: the live index when it exists, else a bounded scan of the
+   * runs root. The bounded scan is the fallback for an index-less pi-subagents; the index
+   * answers the live question without ever being truncated by folder count.
+   */
+  function candidateRunIds(): string[] {
+    const indexed = readActiveRunIndex();
+    if (indexed.length > 0) return indexed;
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(runsRoot, { withFileTypes: true });
+    } catch {
+      return [];
+    }
+    const names: string[] = [];
+    for (const entry of entries) {
+      if (!entry.isDirectory() || names.length >= MAX_RUN_DIRS) continue;
+      if (!isSafeRunId(entry.name)) continue;
+      names.push(entry.name);
+    }
+    return names;
+  }
   /** How a step's own `activityState` is shown: its live tool, else queued, else thinking. */
   function stepActivity(step: Record<string, unknown>): string | undefined {
     const agent = typeof step["agent"] === "string" ? step["agent"] : undefined;
@@ -147,18 +240,9 @@ export function createSubagentSignalCapture(options: SubagentSignalCaptureOption
     return `${agent}: ${tool ?? (status === "pending" ? "queued" : "thinking…")}`;
   }
   function readActiveRuns(): ActiveSubagentRun[] {
-    let entries: fs.Dirent[];
-    try {
-      entries = fs.readdirSync(runsRoot, { withFileTypes: true });
-    } catch {
-      return []; // No runs yet: nothing live to count.
-    }
     const runs: ActiveSubagentRun[] = [];
-    let scanned = 0;
-    for (const entry of entries) {
-      if (!entry.isDirectory() || scanned >= MAX_RUN_DIRS) continue;
-      scanned += 1;
-      const dir = path.join(runsRoot, entry.name);
+    for (const name of candidateRunIds()) {
+      const dir = path.join(runsRoot, name);
       // Ownership first: an unreadable or foreign record is not this session's live work.
       if (!ownsRun(dir)) continue;
       let status: unknown;
@@ -170,7 +254,7 @@ export function createSubagentSignalCapture(options: SubagentSignalCaptureOption
       if (!isRecord(status)) continue;
       const state = typeof status["state"] === "string" ? status["state"] : undefined;
       if (state === undefined || !ACTIVE_RUN_STATES.has(state)) continue;
-      const runId = typeof status["runId"] === "string" ? status["runId"] : entry.name;
+      const runId = typeof status["runId"] === "string" ? status["runId"] : name;
       const steps = Array.isArray(status["steps"]) ? status["steps"].filter(isRecord) : [];
       const activity = steps
         .filter((step) => typeof step["status"] === "string" && (step["status"] === "pending" || step["status"] === "running"))
@@ -179,6 +263,50 @@ export function createSubagentSignalCapture(options: SubagentSignalCaptureOption
       runs.push({ runId, activity: activity.length > 0 ? activity : [`${runId}: ${state}`] });
     }
     return runs.sort((a, b) => a.runId.localeCompare(b.runId));
+  }
+  /** Every run of this session, active or finished, read from its own `status.json`. */
+  function readAllRunStatuses(): SubagentRunStatus[] {
+    const statuses: SubagentRunStatus[] = [];
+    for (const name of candidateRunIds()) {
+      const dir = path.join(runsRoot, name);
+      if (!ownsRun(dir)) continue;
+      let status: unknown;
+      try {
+        status = JSON.parse(fs.readFileSync(path.join(dir, "status.json"), "utf8"));
+      } catch {
+        continue;
+      }
+      if (!isRecord(status)) continue;
+      const rawState = typeof status["state"] === "string" ? status["state"] : undefined;
+      if (rawState === undefined) continue;
+      const steps = Array.isArray(status["steps"]) ? status["steps"].filter(isRecord) : [];
+      const activity = steps
+        .filter((step) => typeof step["status"] === "string" && (step["status"] === "pending" || step["status"] === "running"))
+        .map(stepActivity)
+        .filter((line): line is string => line !== undefined);
+      const runId = typeof status["runId"] === "string" ? status["runId"] : name;
+      statuses.push({
+        runId,
+        state: rawState,
+        active: ACTIVE_RUN_STATES.has(rawState),
+        activity,
+        outputFile: typeof status["outputFile"] === "string" ? status["outputFile"] : undefined,
+        updatedAt: typeof status["lastActivityAt"] === "number" ? status["lastActivityAt"] : undefined,
+      });
+    }
+    return statuses;
+  }
+  /**
+   * Native `bg_wait` id semantics, reproduced (`subagent-wait.js:151-152`): an exact id, or
+   * a prefix shared by run ids, resolves the run; a prefix that matches several is exactly
+   * the error native reports, so it is reported rather than resolved arbitrarily.
+   */
+  function readRunStatus(idOrPrefix: string): SubagentRunStatus | undefined {
+    const statuses = readAllRunStatuses();
+    const exact = statuses.find((entry) => entry.runId === idOrPrefix);
+    if (exact !== undefined) return exact;
+    const prefixed = statuses.filter((entry) => entry.runId.startsWith(idOrPrefix));
+    return prefixed.length === 1 ? prefixed[0] : undefined;
   }
   let unsubscribe: (() => void) | undefined;
   let listenerRef: (() => void) | undefined;
@@ -313,6 +441,10 @@ export function createSubagentSignalCapture(options: SubagentSignalCaptureOption
     },
     all: () => observed.filter((signal) => armedAt >= 0 && signal.observedAt >= armedAt),
     activeRuns: readActiveRuns,
+    activeRunIds: () => readActiveRuns().map((run) => run.runId),
+    status(runId) {
+      return readRunStatus(runId);
+    },
     observeIntercomMessage(message) {
       if (armedAt < 0) return;
       if (message.customType !== "intercom_message") return;

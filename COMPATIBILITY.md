@@ -36,13 +36,18 @@ carries the row number and the original scenario text inline.
 Run records (reproduce locally; `evidence/` is in `.gitignore`, so the logs these
 commands write are per-machine observations and never committed):
 
-- `npm test` → **90 tests, 90 pass, 0 fail**
+- `npm test` → **121 tests, 121 pass, 0 fail**
 - `node scripts/live-e2e.mjs` → **10/10 live checks pass**
 - `node scripts/live-mixed.mjs` → **9/9 live checks pass**
 - `node scripts/live-subagent-only.mjs` → **5/5 live checks pass**
   — the post-reload regression: only a subagent running, one `bg_wait_unified({all:true})`
-- `node scripts/live-attention.mjs` → **6/6 live checks pass**
-  — the attention regression: a subagent tripping `needs_attention` must not end the wait
+- `node scripts/live-attention.mjs` → **7/7 live checks pass**
+  — the attention regression: a subagent tripping `needs_attention` must not end the wait,
+    and the post-reload empty-scope wait must return on the native answer rather than ride
+    out its window (`waited <= native_waited + 20 s`)
+- `node scripts/live-signals.mjs` → **11/11 live checks pass across 6 scenarios** (`intercom`,
+  `intercom-control`, `attention`, `supervisor`, `idle`, `any-subagent`), each ending before
+  its window (5.5 s / 14.1 s / 29.5 s / 12.0 s / 0.6 s / 29.4 s)
 - All four live scripts also pass with `--installed`, i.e. loaded from `settings.json`
 
 ### Not covered: extension load order
@@ -142,6 +147,21 @@ ended on the signal and not on its own window:
 
 Logs go to `evidence/` (gitignored, per-machine). The four pre-existing live scripts (`live-e2e`,
 `live-mixed`, `live-subagent-only`, `live-attention`) and their `--installed` variants stay green.
+
+### The two intercom paths, and the one that cannot be observed
+
+| Path | Artifact | Where it is read |
+| --- | --- | --- |
+| `intercom({action:"ask"})` (expectsReply=true) | `intercom/pending-asks/<sha256(scope)>-<messageId>.json` (`pi-intercom/broker/broker.ts:793-805`, `:1367`) | `src/intercom-probe.ts` |
+| a subagent's escalated notice routed to this session | `subagent:control-intercom` bus event (`pi-subagents/src/runs/background/async-job-tracker.js:205-216`) | `src/subagent-signals.ts` |
+| plain `send` (expectsReply=false) | **none** — `broker.ts:827-831` writes a socket frame only (no ledger record), `pi-intercom/index.ts:1334-1341` delivers it `{deliverAs:"steer"}`, and `agent-session.js:1968-1974` only queues `agent.steer(...)` while a blocking tool holds the turn | not observable during a wait; ends at the next turn boundary via the `message_end` fallback (`extensions/bgwait-bridge.ts:219-232`) |
+
+The `intercom-control` scenario forces the middle row alone: it launches `scout` with
+`control: { failedToolAttemptsBeforeAttention: 1, notifyChannels: ["async","intercom"] }`, so
+pi-subagents writes a control record whose `channels` excludes `event` and therefore emits
+`subagent:control-intercom` only — nothing can shadow the path under test. Live result:
+`waited_ms=28629` of a 120 000 ms window, `Wait ended after 28s because scout sent an intercom
+message in run 71286d12-… (tool_failures).`, verdict line not the attention class.
 
 ## In-process verification (earlier session, after the stopOnAttention fix)
 

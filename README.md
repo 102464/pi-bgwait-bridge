@@ -197,6 +197,32 @@ them — and the wait result says so:
 - **Only signals observed *during* the wait count.** A notice that predates the call does not
   end it: a healthy child already marked `needs_attention` (e.g. an unread ask from an earlier
   turn) must not cut a fresh wait short — that was the 7 ms `attention required` regression.
+- **Platform limit: a plain intercom `send` cannot end a wait, by design.** Each of the three
+  classes above leaves an artifact a wait can read: a bus event (`subagent:control-event`,
+  `subagent:control-intercom`), a request file, or a ledger file. pi-intercom's plain
+  `send` (`expectsReply=false`) leaves none of them:
+  - the broker only writes the ledger for asks — `broker/broker.ts:793-805`
+    (`if (message.expectsReply) { this.writePendingAskRecord(…) }`); a plain send falls
+    straight through to `writeMessage(target.socket, {type:"message", …})`
+    (`broker/broker.ts:827-831`), an in-process socket frame plus the in-memory
+    `messageReceiptRoutes` entry at `broker/broker.ts:826` — nothing on disk;
+  - the receiving extension delivers it as a *steered* custom message:
+    `pi-intercom/index.ts:1334-1341` `pi.sendMessage({customType:"intercom_message", …},
+    … { deliverAs: "steer" })`, and Pi's `sendCustomMessage` in
+    `pi-coding-agent/dist/core/agent-session.js:1968-1974` calls `this.agent.steer(appMessage)`
+    when a run is streaming — the message is queued, not appended, so no `message_start`/
+    `message_end` is emitted while a blocking tool call (this wait) holds the turn;
+  - pi-intercom emits only four bus events (`pi-intercom/index.ts:1125`, `:2067`, `:2095`,
+    `:2173` — outbox result, session identity, subagent result delivery, registry ready);
+    none of them is an inbound message.
+
+  So a wait ends on an ask (ledger), on a subagent-forwarded intercom notice
+  (`subagent:control-intercom`), on an attention notice, and on a supervisor request — and a
+  plain send is reported by the *next* turn, not by the wait. The `message_end` fallback in
+  `extensions/bgwait-bridge.ts:219-232` still covers any intercom message that Pi actually
+  appends to the session while the wait is open (i.e. one that arrives at a turn boundary), so
+  nothing is silently dropped; the queue-only case is the documented limit, and it is not
+  papered over with a synthetic signal.
 - **A session with no background task still ends on a signal.** The native half owns the async
   run scope there; this tool's own loop stays beside it (`holdEmptyScope`) so the signals are
   seen. This is the reported case: `bg_wait_unified({all:true})` in a session whose only work
@@ -205,12 +231,13 @@ them — and the wait result says so:
 ## Testing
 
 ```bash
-npm test                       # 112 unit tests, mock EventBus + controlled time
+npm test                       # 121 unit tests, mock EventBus + controlled time
 node scripts/live-e2e.mjs      # real pi process, real bg task, native bg_wait
 node scripts/live-mixed.mjs    # real subagent + real bg task, one native bg_wait
 node scripts/live-subagent-only.mjs  # only a subagent running: the unified wait must still wait
 node scripts/live-attention.mjs      # a healthy run's attention must not end the wait early
 node scripts/live-signals.mjs        # all three signals end the wait before its window (rpc mode)
+LIVE_SIGNALS_SCENARIOS=intercom-control node scripts/live-signals.mjs  # subagent:control-intercom alone ends the wait
 ```
 
 The live scripts need `pi` on `PATH` (or `PI_LAUNCHER=<path to pi-launcher.js>`), take

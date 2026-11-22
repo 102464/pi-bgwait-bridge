@@ -69,8 +69,33 @@ function scheduleAsker(getTarget: () => string, text: string, delayMs: number): 
   timer.unref?.();
 }
 
+/**
+ * DCE (`pi-deferred-context-engine`) is enabled in this workspace: undeclared tools are deferred
+ * out of the model's active set, and `executeTool` resolves only against the active set, so a
+ * nested call to a deferred tool fails with `Tool <name> not found`. The probe therefore activates
+ * the tool it is about to nest before doing so — the same promotion a model gets from
+ * `search_tools`, done explicitly because this scenario is scripted.
+ */
+function activate(pi: ExtensionAPI, name: string): boolean {
+  const active = pi.getActiveTools();
+  if (active.includes(name)) return true;
+  pi.setActiveTools([...active, name]);
+  return pi.getActiveTools().includes(name);
+}
+
 export default function probe(pi: ExtensionAPI): void {
   pi.on("session_start", (_event, ctx) => {
+    /**
+     * DCE defers every tool that is not declared active for this run, and the model cannot
+     * call a deferred tool at all (`pi-deferred-context-engine` filters declarations and
+     * blocks the call). This scenario is scripted, so both tools it needs are activated here
+     * instead of leaving the model to promote them through `search_tools`.
+     */
+    const needed = ["live_signals_probe", "bg_wait_unified"];
+    const active = pi.getActiveTools();
+    const missing = needed.filter((name) => !active.includes(name));
+    if (missing.length > 0) pi.setActiveTools([...active, ...missing]);
+    log(`activated=${JSON.stringify(needed.filter((name) => pi.getActiveTools().includes(name)))}`);
     log(`hasUI=${String((ctx as { hasUI?: boolean }).hasUI)}`);
     log(`mode=${String((ctx as { mode?: string }).mode)}`);
     log(`intercom_session_id=${String(process.env["PI_INTERCOM_SESSION_ID"] ?? "<unset>")}`);
@@ -84,8 +109,9 @@ export default function probe(pi: ExtensionAPI): void {
     parameters: {
       type: "object",
       properties: {
-        scenario: { type: "string", description: "intercom-ask | generic (another scenario's signal)" },
+        scenario: { type: "string", description: "intercom-ask | any | generic | idle" },
         timeoutMs: { type: "number", description: "Wait window in ms." },
+        stopOnAttention: { type: "boolean", description: "Forwarded verbatim to bg_wait_unified." },
         askDelayMs: { type: "number", description: "Delay before the intercom ask is sent." },
       },
       required: ["scenario"],
@@ -94,6 +120,7 @@ export default function probe(pi: ExtensionAPI): void {
     async execute(_id, params, _signal, _onUpdate, ctx) {
       const scenario = String((params as { scenario?: unknown }).scenario ?? "");
       const timeoutMs = Number((params as { timeoutMs?: unknown }).timeoutMs ?? 90_000);
+      const stopOnAttention = (params as { stopOnAttention?: unknown }).stopOnAttention === true;
       const askDelayMs = Number((params as { askDelayMs?: unknown }).askDelayMs ?? 5_000);
       if (scenario === "intercom-ask") {
         scheduleAsker(
@@ -103,14 +130,17 @@ export default function probe(pi: ExtensionAPI): void {
         );
         log(`ask_scheduled target=${String(process.env["PI_INTERCOM_SESSION_ID"] ?? "")} delay_ms=${String(askDelayMs)}`);
       }
+      // See `activate`: without this the nested call is refused while DCE is enabled.
+      const activated = activate(pi, "bg_wait_unified");
+      log(`activated_bg_wait_unified=${String(activated)}`);
       const startedAt = Date.now();
       log(`scenario=${scenario}`);
       log(`wait_started_at=${String(startedAt)}`);
       const unified = textOf(
         await (ctx as { executeTool: Function }).executeTool("bg_wait_unified", {
-          all: true,
+          ...(scenario === "any" ? { any: true } : { all: true }),
           timeoutMs,
-          stopOnAttention: false,
+          stopOnAttention,
         }),
       );
       const waitedMs = Date.now() - startedAt;
