@@ -23,6 +23,8 @@ interface HarnessOptions {
   /** Extra ids that behave like async subagents still running. */
   subagentActive?: () => string[];
   supervisor?: () => boolean;
+  /** The request as read from its file; production always supplies one with `supervisor`. */
+  supervisorDetail?: () => { requestId: string; reason?: string | undefined; runId?: string | undefined; agent?: string | undefined } | undefined;
   /**
    * Wire a signal capture built on this harness's own bus (it must be the same bus the wait
    * subscribes to). The setup arms the capture and returns the predicate plus a disarm.
@@ -61,6 +63,7 @@ function harness(options: HarnessOptions = {}) {
     events: bus,
     providers: () => [PROVIDER_NAME],
     ...(options.supervisor ? { hasSupervisorRequest: options.supervisor } : {}),
+    ...(options.supervisorDetail ? { supervisorRequestDetail: options.supervisorDetail } : {}),
     ...(armed ? { pendingSubagentSignal: armed.signal } : {}),
     ...(options.activeRuns ? { activeRuns: options.activeRuns } : {}),
     ...(options.nativeWait ? { nativeWait: options.nativeWait } : {}),
@@ -192,6 +195,46 @@ test("a supervisor request ends the wait even with stopOnAttention:false", async
   supervisor = true;
   const result = await pending;
   assert.match(result.text, /subagent needs a supervisor reply/i, result.text);
+  h.bridge.dispose();
+});
+
+test("the supervisor verdict names the request file it read", async () => {
+  // The closing sentence has to be evidence the request *directory* was read: pi-subagents
+  // emits the attention notice ~130 ms BEFORE it writes the request JSON, so a verdict built
+  // from the bus notice could never name a request id that exists on disk.
+  let supervisor = false;
+  const detail = { requestId: "req-own", reason: "interview_request", runId: "run-own", agent: "scout" };
+  const h = harness({ supervisor: () => supervisor, supervisorDetail: () => (supervisor ? detail : undefined) });
+  await start(h, ["bg-sup-detail"]);
+  const pending = h.runner({ all: true, stopOnAttention: false, timeoutMs: 5000 }, undefined, undefined, undefined);
+  await tick(40);
+  supervisor = true;
+  const result = await pending;
+  assert.match(
+    result.text,
+    /needs a supervisor reply \(request req-own, reason interview_request, run run-own, from scout\)/,
+    result.text,
+  );
+  h.bridge.dispose();
+});
+
+test("a supervisor_request notice on the bus never ends the wait by itself", async () => {
+  // The bug the live supervisor log exposed: the bus notice won the race and the wait's closing
+  // sentence said "scout needs attention in run … (supervisor_request)" instead of reporting the
+  // request file. The attention handler drops that reason on purpose; the probe is the trigger.
+  writeRunDir(OWNED_DIR, "C:/sessions/A.jsonl");
+  const h = harness({ signalSetup: (bus) => {
+    const capture = createSubagentSignalCapture({ events: bus, sessionIds: () => ["sess-A", "C:/sessions/A.jsonl"] });
+    const off = capture.arm(() => {});
+    return { signal: () => capture.pending(), off };
+  } });
+  await start(h, ["bg-sup-notice"]);
+  const pending = h.runner({ all: true, stopOnAttention: false, timeoutMs: 250 }, undefined, undefined, undefined);
+  await tick(40);
+  h.bus.emit("subagent:control-event", attentionPayload(OWNED_DIR, { reason: "supervisor_request", message: "scout is waiting for a supervisor reply" }));
+  const result = await pending;
+  assert.doesNotMatch(result.text, /needs attention in run run-own/i, "the bus notice is not allowed to decide this class");
+  assert.match(result.text, /Wait window elapsed/i, result.text);
   h.bridge.dispose();
 });
 

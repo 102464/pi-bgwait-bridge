@@ -188,12 +188,21 @@ them — and the wait result says so:
 - **Three signals end the wait (operator requirement, 2026-11-22).** An attention notice from
   a run of this session (`scout needs attention in run …`), an intercom message/ask another
   agent routed here (`… is waiting for a reply over intercom (ask …)`, with the question
-  quoted), and a real `contact_supervisor` request (`… needs a supervisor reply`) all end
-  `bg_wait_unified` before its window, with `Work keeps running.` The work is never killed.
-  Sources: `src/subagent-signals.ts` (bus events, attributed to this session's runs by the
-  launching `sessionId` in `status.json`), `src/intercom-probe.ts` (pi-intercom's own
-  `pending-asks` ledger, because a steered intercom message is invisible while a blocking tool
-  holds the turn), `src/supervisor-probe.ts` (pi-subagents' request files).
+  quoted), and a real `contact_supervisor` request (`… needs a supervisor reply (request …, reason
+  …, run …, from …)`) all end `bg_wait_unified` before its window, with
+  `Work keeps running.` The work is never killed. Sources: `src/subagent-signals.ts` (bus
+  events, attributed to this session's runs by the launching `sessionId` in `status.json`),
+  `src/intercom-probe.ts` (pi-intercom's own `pending-asks` ledger, because a steered intercom
+  message is invisible while a blocking tool holds the turn), `src/supervisor-probe.ts`
+  (pi-subagents' request files).
+- **A supervisor request is decided by its request file, not by the bus notice.** pi-subagents
+  emits the `needs_attention`/`supervisor_request` notice ~130 ms *before* it writes the request
+  JSON (measured: event `ts` 1795346701226, request `createdAt` 1795346701359), so a notice-driven
+  path would win every race and close the wait as the *attention* class. `onControlEvent`
+  therefore drops that one reason, the probe owns the class, and the verdict names the file it
+  read (`request <id>, reason <reason>, run <id>, from <agent>`). Both blocking reasons are
+  covered — `need_decision` and `interview_request` (upstream blocks on either:
+  `expectsReply = params.reason !== "progress_update"`, `native-supervisor-channel.js:133`).
 - **Only signals observed *during* the wait count.** A notice that predates the call does not
   end it: a healthy child already marked `needs_attention` (e.g. an unread ask from an earlier
   turn) must not cut a fresh wait short — that was the 7 ms `attention required` regression.
@@ -231,17 +240,21 @@ them — and the wait result says so:
 ## Testing
 
 ```bash
-npm test                       # 121 unit tests, mock EventBus + controlled time
+npm test                       # 125 unit tests, mock EventBus + controlled time
 node scripts/live-e2e.mjs      # real pi process, real bg task, native bg_wait
 node scripts/live-mixed.mjs    # real subagent + real bg task, one native bg_wait
 node scripts/live-subagent-only.mjs  # only a subagent running: the unified wait must still wait
 node scripts/live-attention.mjs      # a healthy run's attention must not end the wait early
-node scripts/live-signals.mjs        # all three signals end the wait before its window (rpc mode)
+node scripts/live-signals.mjs        # seven scenarios: every signal class ends the wait before its window (rpc mode)
+LIVE_SIGNALS_SCENARIOS=supervisor-interview node scripts/live-signals.mjs  # contact_supervisor({reason:"interview_request"}) alone ends the wait
 LIVE_SIGNALS_SCENARIOS=intercom-control node scripts/live-signals.mjs  # subagent:control-intercom alone ends the wait
 ```
 
 The live scripts need `pi` on `PATH` (or `PI_LAUNCHER=<path to pi-launcher.js>`), take
-1–3 minutes, and assert on `[live-e2e]` / `[live-mixed]` evidence lines.
+1–3 minutes, and assert on `[live-e2e]` / `[live-mixed]` / `[live-signals]` evidence lines.
+`LIVE_SIGNALS_SCENARIOS` takes a comma-separated subset of
+`intercom, intercom-control, attention, supervisor, supervisor-interview, idle, any-subagent`,
+which is how the per-class logs in `COMPATIBILITY.md` were produced.
 
 See `COMPATIBILITY.md` for the tested matrix and known limits, and `AGENTS.md` for the
 rules this package holds itself to.

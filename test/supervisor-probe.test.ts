@@ -69,6 +69,39 @@ test("a pending request owned by this session is detected", () => {
   f.cleanup();
 });
 
+test("the pending detail is read from the request file, including an interview request", () => {
+  // `interview_request` is the other blocking reason (`native-supervisor-channel.js:133`
+  // `expectsReply = params.reason !== "progress_update"`), and it usually carries no `message`
+  // at all (`:128`). The wait's closing sentence names these fields, so they must come from the
+  // file rather than from any bus notice.
+  const f = fixture();
+  writeRequest(f.dir, "run-2-scout-0", "req-interview", {
+    type: "subagent.supervisor.request",
+    id: "req-interview",
+    reason: "interview_request",
+    expectsReply: true,
+    orchestratorSessionId: "sess-A",
+    runId: "run-2",
+    agent: "scout",
+    interview: { title: "RTL batch interview" },
+  });
+  const probe = createSupervisorProbe({ sessionIds: () => ["sess-A"], tempRoot: f.root });
+  assert.deepEqual(probe.pendingDetail(), {
+    requestId: "req-interview",
+    reason: "interview_request",
+    runId: "run-2",
+    agent: "scout",
+  });
+  f.cleanup();
+});
+
+test("pendingDetail reports nothing when no request is outstanding", () => {
+  const f = fixture();
+  const probe = createSupervisorProbe({ sessionIds: () => ["sess-A"], tempRoot: f.root });
+  assert.equal(probe.pendingDetail(), undefined);
+  f.cleanup();
+});
+
 test("a request owned by another session is ignored", () => {
   const f = fixture();
   writeRequest(f.dir, "run-1-scout-0", "req-other", {

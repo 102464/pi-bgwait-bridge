@@ -247,6 +247,63 @@ in the tool's own `promptGuidelines`.
   code run outside Pi. The parameter schema therefore lives in the extension module
   (`extensions/bgwait-bridge.ts`) while `src/**` stays dependency-free and unit-testable.
 
+## 3b. pi-subagents: the supervisor request file, and why the bus notice cannot decide it
+
+A `contact_supervisor` call is a *blocking* supervisor tool only for two reasons
+(`src/runs/shared/supervisor-wait-timer.js:2-9` `isBlockingSupervisorTool`: `reason ===
+"need_decision" || reason === "interview_request"`; for `intercom` it is `action === "ask"`).
+Only those produce a request file, and the request is written by
+`src/intercom/native-supervisor-channel.js#sendSupervisorRequest`:
+
+```js
+// native-supervisor-channel.js:128,133,139-159
+if (!params.message?.trim() && params.reason !== "interview_request") throw new Error(…);
+const expectsReply = params.reason !== "progress_update";
+const request = { type: "subagent.supervisor.request", id, createdAt, …(expiresAt),
+  reason: params.reason, message, expectsReply, …(orchestratorTarget), …(orchestratorSessionId),
+  runId, agent, childIndex, …(toolCallId), …(childTarget), …(params.interview) };
+writeAtomicJson(requestPath(metadata.channelDir, requestId), request);
+```
+
+Consequences the package depends on:
+
+* an `interview_request` may legitimately carry **no** `message` (:128), which is why the probe
+  reads `reason`/`runId`/`agent` from the file instead of from a notice's text;
+* `progress_update` is not a barrier (`expectsReply === false`), so the probe skips it;
+* the request file lives under `<temp>/supervisor-channels/<runId>-<agent>-<child>/requests/`
+  and its reply under `…/replies/<requestId>.json`, and `requestLifecycle` (:446-458) treats a
+  reply file as resolved — the two facts `src/supervisor-probe.ts` relies on.
+
+The ordering problem that forced the current design: pi-subagents' own control notice is
+emitted from `src/runs/background/async-job-tracker.js:2857` (`appendControlEvent({type:
+"needs_attention", reason: "supervisor_request", …})`) **before** the child's request file exists.
+Measured on a live run (2026-11-22): control event `ts` **1795346701226**, request file
+`createdAt` **1795346701359** — 133 ms apart, notice first. A wait that accepted the notice for
+this class would therefore always report `… needs attention in run … (supervisor_request)`, i.e.
+the attention class, and would never read the request directory. `src/subagent-signals.ts#
+onControlEvent` drops that one reason for exactly this reason; the probe owns the class, is woken
+by the directory (`externalWake`), and the verdict prints the request id it read.
+
+Both blocking reasons were then exercised in a real Pi session (`--mode rpc`, nothing injected),
+with the verdict taken from separate logs:
+
+| Reason | Per-class log | Result | Disk check |
+| --- | --- | --- | --- |
+| `need_decision` | `evidence/live-signals-supervisor-need-decision.log` | `waited_ms=11415` of 120 000 ms, `… needs a supervisor reply (request a99feb4f-…, reason need_decision, run f6f25773-…)` | `supervisor-channels/f6f25773-…-scout-0/replies/a99feb4f-….json` exists with a real supervisor message and `requests/` is empty (upstream moves the file on reply), i.e. the request was outstanding while the wait ran |
+| `interview_request` | `evidence/live-signals-supervisor-interview.log` | `waited_ms=11805` of 120 000 ms, `… needs a supervisor reply (request 653a84ff-…, reason interview_request, run d66cb7f0-…)`, verdict line explicitly asserted to be the supervisor class and **not** an attention notice | same shape: `supervisor-channels/d66cb7f0-…-scout-0/replies/653a84ff-….json` present, `requests/` empty |
+
+The `interview_request` row also proves the `:128` allowance in practice: the live child passed
+its questions through `interview: {title, questions}` and the request stayed blocking
+(`expectsReply: true`).
+
+## 3c. pi-intercom: the three inbound paths and what each leaves on disk
+
+| Path | Artifact | Observable during this wait |
+| --- | --- | --- |
+| `ask` (`expectsReply=true`) | `intercom/pending-asks/<scope>-<id>.json`: `{askId, messageId, asker{…}, target{…}, question, createdAt, expiresAt}` (`broker/broker.ts:793-805`, `:833-871`, removed by `removePendingAskRecord`/`pruneAskEdges`) | yes — `src/intercom-probe.ts` reads the ledger |
+| `subagent:control-intercom` | bus event `payload.intercom{to,message}` from `async-job-tracker.js:210` (intercom channel only, never for `active_long_running`) | yes — `src/subagent-signals.ts` |
+| plain `send` (`expectsReply=false`) | only the socket frame `writeMessage(target.socket, {type:"message", …})` (`broker.ts:827-831`) plus the in-memory `messageReceiptRoutes` entry (`:826`); receiver injects it with `sendMessage(…, {deliverAs:"steer"})` (`pi-intercom/index.ts:1334-1341`) → `agent-session.js:1968-1974` `this.agent.steer(appMessage)` | no — queued until a turn boundary; documented as a platform limit |
+
 ## 4. Differences from the upstream `main` docs the brief linked
 
 The brief points at

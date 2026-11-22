@@ -36,7 +36,7 @@ carries the row number and the original scenario text inline.
 Run records (reproduce locally; `evidence/` is in `.gitignore`, so the logs these
 commands write are per-machine observations and never committed):
 
-- `npm test` → **121 tests, 121 pass, 0 fail**
+- `npm test` → **125 tests, 125 pass, 0 fail**
 - `node scripts/live-e2e.mjs` → **10/10 live checks pass**
 - `node scripts/live-mixed.mjs` → **9/9 live checks pass**
 - `node scripts/live-subagent-only.mjs` → **5/5 live checks pass**
@@ -125,11 +125,39 @@ applies. An event-flag listener was rejected because a request is resolved in th
 (`subagent_supervisor({action:"reply"})`, :613-620) or in pi-subagents' own poll, so an outside
 observer could never learn it was answered and would latch "pending" forever.
 
+### The bus notice is not allowed to decide the supervisor class
+
+pi-subagents emits the attention notice **before** it writes the request file. Measured on a live
+run (2026-11-22): the `subagent.control` event carries `ts: 1795346701226`, the request JSON has
+`createdAt: 1795346701359` — a **133 ms race the notice wins**. Before this fix the wait ended on
+that notice, and its closing sentence said `<agent> needs attention in run <id>
+(supervisor_request)`: the attention class, i.e. the bus path, not the request directory.
+
+The two changes that fix it:
+
+1. `src/subagent-signals.ts#onControlEvent` drops `reason: "supervisor_request"` instead of
+   recording it as an attention signal, so only the probe can decide that class (it is woken by
+   the request directory through `externalWake`, so this costs no latency). Attention notices
+   from any other reason (`tool_failures`, `active_long_running`, …) are unaffected, and the
+   `intercom` channel is a separate class with its own bus event.
+2. `WaitOutcome` carries the request it read — `{ kind: "supervisor_request", request }
+   (SupervisorRequestDetail: requestId / reason / runId / agent)` — so the verdict prints
+   `because a subagent needs a supervisor reply (request <id>, reason <reason>, run <id>, from
+   <agent>)`. A request id can only come from a file on disk, which makes the sentence itself
+   the evidence that the directory was read.
+
+Both blocking reasons are covered, because upstream blocks on either: `expectsReply =
+params.reason !== "progress_update"` (`native-supervisor-channel.js:133`). An
+`interview_request` usually carries no `message` at all (`:128`), which is why the probe reads
+`reason`/`runId`/`agent` from the file rather than from a notice's text.
+
 Covered by `test/mixed-scope-defaults.test.ts` (opt-in behaviour, plus the empty-background-scope
-signal case), `test/supervisor-probe.test.ts` (11 cases), `test/unified-wait.test.ts` (signal
-rows), `test/intercom-probe.test.ts` (10 cases), and two live scripts: `scripts/live-attention.mjs`
-(a healthy run's notice must not cut the wait short before it is observed) and
-`scripts/live-signals.mjs` (all three signal classes, `--mode rpc`).
+signal case), `test/supervisor-probe.test.ts` (13 cases, incl. `pendingDetail()` for
+`interview_request` and no-request), `test/unified-wait.test.ts` (signal rows, incl. "the
+supervisor verdict names the request file it read" and "a supervisor_request notice on the bus
+never ends the wait by itself"), `test/intercom-probe.test.ts` (10 cases), and two live scripts:
+`scripts/live-attention.mjs` (a healthy run's notice must not cut the wait short before it is
+observed) and `scripts/live-signals.mjs` (all three signal classes, `--mode rpc`).
 
 ## Live verification of the three signals (2026-11-22)
 
@@ -139,11 +167,19 @@ inbound ask into a *busy* session instead of auto-answering and dismissing it
 (`pi-intercom/index.ts:1360-1384`). Each scenario asserts `waited_ms < timeoutMs`, i.e. the wait
 ended on the signal and not on its own window:
 
-| Signal | What produced it | Result |
-| --- | --- | --- |
-| intercom | a `pi-intercom` CLI process asking this session, 5 s after the wait began | ended after 6.3 s (window 90 s), text quotes the ask |
-| attention | sibling `scout` subagent tripping the repeated-failure path (`tool_failures`) | ended after 15.0 s (window 120 s), text names run + agent + reason |
-| contact_supervisor | sibling subagent calling `contact_supervisor({reason:"need_decision"})` | ended after 10.8 s (window 120 s), text says it is waiting for a supervisor reply |
+| Signal | What produced it | Per-class log | Result |
+| --- | --- | --- | --- |
+| intercom ask | a `pi-intercom` CLI process asking this session, 5 s after the wait began | `evidence/live-signals-intercom-ask.log` | ended after 5.5 s (window 90 s); the ask id in the text matches `intercom/pending-asks/<id>.json` |
+| intercom control | sibling `scout` escalated with the `event` channel withheld | `evidence/live-signals-intercom-control.log` | ended after 10.9 s (window 120 s); the run's `events.jsonl` control record has `channels: ["async","intercom"]` and `intercom.to` set, so no bus notice could have produced it |
+| attention | sibling `scout` tripping the repeated-failure path (`tool_failures`) | `evidence/live-signals.log` (`attention` scenario) | ended after 13.5 s (window 120 s), text names run + agent + reason |
+| contact_supervisor `need_decision` | sibling subagent calling `contact_supervisor({reason:"need_decision"})` | `evidence/live-signals-supervisor-need-decision.log` | ended after 11.4 s (window 120 s); the request id in the text has a real `replies/<id>.json` and an empty `requests/` dir, i.e. the request was outstanding while the wait ran |
+| contact_supervisor `interview_request` | sibling subagent calling `contact_supervisor({reason:"interview_request", interview:{…}})` | `evidence/live-signals-supervisor-interview.log` | ended after 11.8 s (window 120 s); verdict line is the supervisor class, not an attention notice |
+| idle session | nothing running | `evidence/live-signals.log` (`idle` scenario) | answered after 0.5 s instead of riding out a 20-minute window |
+| `any:true`, subagents only | one async `scout` run | `evidence/live-signals.log` (`any-subagent` scenario) | ended after 24.5 s carrying the native answer, no self-inflicted native failure |
+
+Every row asserts `waited_ms < timeoutMs` and that the verdict line is the class it names. One
+`LIVE_SIGNALS_SCENARIOS=…` value runs a subset; the full sweep is seven scenarios, all green
+(`All live signal checks passed (7 scenario(s)).`).
 
 Logs go to `evidence/` (gitignored, per-machine). The four pre-existing live scripts (`live-e2e`,
 `live-mixed`, `live-subagent-only`, `live-attention`) and their `--installed` variants stay green.
@@ -159,19 +195,32 @@ Logs go to `evidence/` (gitignored, per-machine). The four pre-existing live scr
 The `intercom-control` scenario forces the middle row alone: it launches `scout` with
 `control: { failedToolAttemptsBeforeAttention: 1, notifyChannels: ["async","intercom"] }`, so
 pi-subagents writes a control record whose `channels` excludes `event` and therefore emits
-`subagent:control-intercom` only — nothing can shadow the path under test. Live result:
-`waited_ms=28629` of a 120 000 ms window, `Wait ended after 28s because scout sent an intercom
-message in run 71286d12-… (tool_failures).`, verdict line not the attention class.
+`subagent:control-intercom` only — nothing can shadow the path under test. Live result
+(`evidence/live-signals-intercom-control.log`): `waited_ms=10907` of a 120 000 ms window,
+`Wait ended after 10s because scout sent an intercom message in run cd6b47a9-…
+(tool_failures).`, verdict line not the attention class. The run's own `events.jsonl` record is
+`channels: ["async", "intercom"]` with `intercom.to: subagent-chat-…`, which is the independent
+check that the withheld `event` channel really was absent.
 
-## In-process verification (earlier session, after the stopOnAttention fix)
+## How to re-check a live row by hand
 
-A local note (`evidence/in-process-live-verification.md`, written then and not committed) records
-12 scenarios run inside a Pi session with the fixed extension loaded: two `bg_run` alone returning
-`0 async run(s) and 2 provider item(s)` (no `No active async runs`), three bg tasks plus one
-subagent under `{all:true}`, `{any:true}` early return, exact ids, timeout-with-work-continuing,
-and a real supervisor request ending it in 8 s while a 40 s bg task kept running. One row of that
-note described the *previous* rule (a generic attention notice not ending the wait); the rule is
-now "a signal observed during the wait ends it", per the operator decision above.
+Each per-class log is reproducible and every claim in it can be traced to disk, so a reviewer does
+not have to trust the log:
+
+1. Take the run id or request id out of the verdict sentence in the log.
+2. For an intercom ask: open `<agentDir>/intercom/pending-asks/<askId>.json` — it must exist with
+   `target.sessionId` equal to the session that ran the wait.
+3. For the control-intercom row: open `<tempRoot>/async-subagent-runs/<runId>/events.jsonl` and
+   find the `"subagent.control"` envelope — `channels` must not contain `"event"`.
+4. For a supervisor row: open `<tempRoot>/supervisor-channels/<runId>-<agent>-0/` — a
+   `requests/<requestId>.json` still present means the request was outstanding when the wait
+   ended; a `replies/<requestId>.json` with an empty `requests/` dir means it was answered
+   afterwards (upstream moves the file on reply).
+5. For the attention row: open `<tempRoot>/async-subagent-runs/<runId>/status.json` and compare
+   its `sessionId` with the session that started the wait.
+
+The earlier in-process note is deliberately gone: it was produced by a pre-fix build and by an
+in-process injection, which is not the evidence this contract asks for.
 
 ## Platform support
 

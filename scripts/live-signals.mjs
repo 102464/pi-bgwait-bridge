@@ -29,6 +29,15 @@ const SUPERVISOR_TASK =
   "Call contact_supervisor exactly once with reason \"need_decision\" and the message \"which arm should I take for the next RTL batch?\". Then stop and wait for the reply. After the reply arrives, reply with exactly SIGNALS_OK.";
 
 /**
+ * The same ask with the other blocking reason. Upstream requires no `message` for it
+ * (`native-supervisor-channel.js:128`), but a supervisor has to know what is being asked, so
+ * the interview payload carries the questions and the request stays blocking exactly as a
+ * decision does (`expectsReply = params.reason !== "progress_update"`, :133).
+ */
+const INTERVIEW_TASK =
+  "Call contact_supervisor exactly once with reason \"interview_request\" and this interview payload: {\"title\":\"RTL batch interview\",\"questions\":[{\"id\":\"arm\",\"prompt\":\"which arm should I take for the next RTL batch?\"}]}. Then stop and wait for the reply. After the reply arrives, reply with exactly SIGNALS_OK.";
+
+/**
  * Holds the wait open with real work: a subagent that sleeps for a minute. It trips no
  * attention path (the tool-open threshold upstream is 240 s), so the only signal in the wait
  * is the intercom ask the probe schedules.
@@ -175,7 +184,7 @@ async function scenario(name, prompt, { prefix = "live-signals", checks }) {
 }
 
 async function main() {
-  const scenarios = (process.env["LIVE_SIGNALS_SCENARIOS"] ?? "intercom,intercom-control,attention,supervisor,idle,any-subagent").split(",");
+  const scenarios = (process.env["LIVE_SIGNALS_SCENARIOS"] ?? "intercom,intercom-control,attention,supervisor,supervisor-interview,idle,any-subagent").split(",");
   const results = [];
 
   if (scenarios.includes("intercom")) {
@@ -342,7 +351,7 @@ async function main() {
     // so pi-subagents writes its own request file into its own channel dir. Nothing is forged here.
     results.push(
       await scenario(
-        "contact_supervisor request",
+        "contact_supervisor need_decision request",
         `Make exactly two tool calls in this response: (1) subagent with ${JSON.stringify({
           agent: "scout",
           task: SUPERVISOR_TASK,
@@ -356,11 +365,52 @@ async function main() {
               `waited=${String(waitedMs)}ms timeout=${String(timeoutMs)}ms`,
             ],
             [
-              "the text says a subagent needs a supervisor reply",
-              // The bus path says "<agent> is waiting for a supervisor reply", the file path says
-              // "a subagent needs a supervisor reply"; both are the same ask.
-              /needs a supervisor reply|waiting for a supervisor reply/i.test(unified),
-              unified.replace(/\n/g, " | ").slice(0, 260),
+              "the text names the request file it read",
+              // `src/unified-tool.ts` prints `(request <id>, reason <reason>, run <id>, from <agent>)`
+              // from `SupervisorRequestDetail`, which only the request directory can supply. The
+              // bus notice cannot produce this sentence.
+              /needs a supervisor reply \(request \S+, reason need_decision, run \S+/i.test(unified),
+              unified.replace(/\n/g, " | ").slice(0, 300),
+            ],
+            [
+              "the verdict line is the supervisor class, not an attention notice",
+              /^Wait ended .*needs a supervisor reply/i.test(verdictLine(unified)),
+              verdictLine(unified),
+            ],
+          ],
+        },
+      ),
+    );
+  }
+
+  if (scenarios.includes("supervisor-interview")) {
+    // The second blocking reason the objective names. Upstream blocks on it identically, and the
+    // probe must report it from the same request directory — an interview request that answered
+    // only on `subagent:control-event` would be the same defect as `need_decision` on the bus.
+    results.push(
+      await scenario(
+        "contact_supervisor interview_request",
+        `Make exactly two tool calls in this response: (1) subagent with ${JSON.stringify({
+          agent: "scout",
+          task: INTERVIEW_TASK,
+          async: true,
+        })}, and (2) live_signals_probe with {"scenario":"generic","timeoutMs":120000}. Then reply with exactly SIGNALS_DONE.`,
+        {
+          checks: ({ unified, waitedMs, timeoutMs }) => [
+            [
+              "the wait ended on the interview request, not on its window",
+              waitedMs > 0 && timeoutMs > 0 && waitedMs < timeoutMs,
+              `waited=${String(waitedMs)}ms timeout=${String(timeoutMs)}ms`,
+            ],
+            [
+              "the text names the interview request it read",
+              /needs a supervisor reply \(request \S+, reason interview_request, run \S+/i.test(unified),
+              unified.replace(/\n/g, " | ").slice(0, 300),
+            ],
+            [
+              "the verdict line is the supervisor class, not an attention notice",
+              /^Wait ended .*needs a supervisor reply/i.test(verdictLine(unified)),
+              verdictLine(unified),
             ],
           ],
         },

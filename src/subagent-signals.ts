@@ -355,9 +355,16 @@ export function createSubagentSignalCapture(options: SubagentSignalCaptureOption
     if (event["type"] !== "needs_attention") return;
     const runId = typeof event["runId"] === "string" ? event["runId"] : undefined;
     if (runId === undefined) return;
+    // `subagent:control-event` never decides the supervisor class: the request file does.
+    //
+    // pi-subagents emits the attention notice ~130 ms BEFORE it writes the request JSON
+    // (measured 2026-11-22: control event ts 1795346701226, request createdAt 1795346701359),
+    // so an attention-only path would win every race and the closing sentence of the wait
+    // would name the bus notice instead of the request directory. The probe reads that
+    // directory (and is woken by it through `externalWake`), which is the only trigger the
+    // operator's requirement accepts for `contact_supervisor`.
+    if (typeof event["reason"] === "string" && event["reason"] === "supervisor_request") return;
     // Native supervisor asks are the probe's job: they have a lifecycle this bus payload lacks.
-    // They still count here as attention, which is what the operator asked for; the probe
-    // additionally reports a *pre-existing* request before any event fires.
     if (!ownsRun(asyncDirOf(data))) return;
     record({
       kind: "attention",

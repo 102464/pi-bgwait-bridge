@@ -28,8 +28,23 @@ export interface SupervisorProbeOptions {
   now?: () => number;
 }
 
+/**
+ * One pending request, with the facts read from the request file itself.
+ *
+ * The identifier is here on purpose: only a verdict that read the file can name the request,
+ * so the wait's closing sentence is evidence of the file path rather than of a bus notice.
+ */
+export interface SupervisorRequestDetail {
+  requestId: string;
+  reason?: string | undefined;
+  runId?: string | undefined;
+  agent?: string | undefined;
+}
+
 export interface SupervisorProbe {
   hasPending(): boolean;
+  /** The first pending request, from the request file; `undefined` when none is pending. */
+  pendingDetail(): SupervisorRequestDetail | undefined;
   /** Pending request ids, for tool output. */
   pendingIds(): string[];
   root(): string;
@@ -83,6 +98,9 @@ interface RequestFile {
   orchestratorSessionId?: unknown;
   expectsReply?: unknown;
   expiresAt?: unknown;
+  reason?: unknown;
+  runId?: unknown;
+  agent?: unknown;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -95,9 +113,9 @@ export function createSupervisorProbe(options: SupervisorProbeOptions): Supervis
     options.tempRoot ?? resolveSubagentTempRoot(),
   );
   let cachedAt = -1;
-  let cachedIds: string[] = [];
+  let cachedRequests: SupervisorRequestDetail[] = [];
 
-  function scan(): string[] {
+  function scan(): SupervisorRequestDetail[] {
     const accepted = options.sessionIds();
     if (accepted.length === 0) return [];
     let entries: fs.Dirent[];
@@ -106,7 +124,7 @@ export function createSupervisorProbe(options: SupervisorProbeOptions): Supervis
     } catch {
       return []; // No supervisor channel root yet: nothing can be pending.
     }
-    const ids: string[] = [];
+    const requests: SupervisorRequestDetail[] = [];
     let scannedDirs = 0;
     for (const entry of entries) {
       if (!entry.isDirectory()) continue;
@@ -144,18 +162,23 @@ export function createSupervisorProbe(options: SupervisorProbeOptions): Supervis
         // ourselves so a request answered in another turn is never counted again.
         const requestId = file.name.slice(0, -"\u002ejson".length);
         if (fs.existsSync(path.join(repliesDir, `${requestId}.json`))) continue;
-        ids.push(requestId);
+        requests.push({
+          requestId,
+          ...(typeof request.reason === "string" ? { reason: request.reason } : {}),
+          ...(typeof request.runId === "string" ? { runId: request.runId } : {}),
+          ...(typeof request.agent === "string" ? { agent: request.agent } : {}),
+        });
       }
     }
-    return ids;
+    return requests;
   }
 
-  function refresh(): string[] {
+  function refresh(): SupervisorRequestDetail[] {
     const stamp = now();
-    if (cachedAt >= 0 && stamp - cachedAt < 250) return cachedIds;
-    cachedIds = scan();
+    if (cachedAt >= 0 && stamp - cachedAt < 250) return cachedRequests;
+    cachedRequests = scan();
     cachedAt = stamp;
-    return cachedIds;
+    return cachedRequests;
   }
 
   /** Channel dirs whose contents change when a request is written, answered, or removed. */
@@ -185,12 +208,13 @@ export function createSupervisorProbe(options: SupervisorProbeOptions): Supervis
   };
   return {
     hasPending: () => refresh().length > 0,
-    pendingIds: () => refresh(),
+    pendingDetail: () => refresh()[0],
+    pendingIds: () => refresh().map((request) => request.requestId),
     root: () => root,
     watchedDirs,
     invalidate: () => {
       cachedAt = -1;
-      cachedIds = [];
+      cachedRequests = [];
     },
   };
 }

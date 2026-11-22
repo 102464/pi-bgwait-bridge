@@ -309,6 +309,8 @@ export default function activate(pi: ExtensionAPI): void {
           // The probe reads pi-subagents' own request files, the same data `requestMatchesOwner`
           // uses, so a request answered in an earlier turn is not counted again.
           hasSupervisorRequest: () => supervisor.hasPending(),
+          // The request itself, so the closing sentence names a file that exists on disk.
+          supervisorRequestDetail: () => supervisor.pendingDetail(),
           /**
            * Attention / intercom signals end this wait too (operator requirement). The capture
            * is armed on the first tick, so a stale notice that fired before the call is not

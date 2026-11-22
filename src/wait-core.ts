@@ -16,6 +16,7 @@
  */
 import type { TerminalRecord } from "./bridge.ts";
 import type { SubagentSignal } from "./subagent-signals.ts";
+import type { SupervisorRequestDetail } from "./supervisor-probe.ts";
 import { DEFAULT_POLL_MS, MIN_POLL_MS } from "./constants.ts";
 import { isActiveStatus, isTerminalStatus, type EventBusLike, type WaitTargetTask } from "./types.ts";
 
@@ -24,7 +25,7 @@ export type WaitOutcome =
   | { kind: "timeout" }
   | { kind: "aborted"; reason: string }
   | { kind: "user_input" }
-  | { kind: "supervisor_request" }
+  | { kind: "supervisor_request"; request?: SupervisorRequestDetail }
   | { kind: "subagent_signal"; signal: SubagentSignal }
   | { kind: "provider_disappeared"; provider: string };
 
@@ -47,6 +48,14 @@ export interface WaitDeps {
   providers?: () => readonly string[];
   /** True when a subagent supervisor request is outstanding. */
   hasSupervisorRequest?: () => boolean;
+  /**
+   * The outstanding request as read from its file, so the wait can name it.
+   *
+   * Naming the request is what makes the closing sentence evidence of the request directory
+   * rather than of a bus notice: `subagent-signals.ts#onControlEvent` deliberately drops
+   * `reason:"supervisor_request"` because that notice lands ~130 ms *before* the file exists.
+   */
+  supervisorRequestDetail?: () => SupervisorRequestDetail | undefined;
   /** A subagent signal observed during this wait that must end it (attention / intercom). */
   pendingSubagentSignal?: () => SubagentSignal | undefined;
   /** Wakes the loop on state change; returns an unsubscribe. */
@@ -162,8 +171,15 @@ export async function waitForWork(scope: WaitScope, request: WaitRequest, deps: 
         return terminal === undefined && deps.activeIds().includes(id);
       });
 
+    const supervisorOutcome = (): WaitOutcome | undefined => {
+      if (!deps.hasSupervisorRequest?.()) return undefined;
+      const request = deps.supervisorRequestDetail?.();
+      return request === undefined ? { kind: "supervisor_request" } : { kind: "supervisor_request", request };
+    };
+
     const isDone = (): WaitOutcome | undefined => {
-      if (deps.hasSupervisorRequest?.()) return { kind: "supervisor_request" };
+      const supervisor = supervisorOutcome();
+      if (supervisor) return supervisor;
       const signal = deps.pendingSubagentSignal?.();
       if (signal) return { kind: "subagent_signal", signal };
       if (request.signal?.aborted) return { kind: "aborted", reason: "signal" };
@@ -206,7 +222,8 @@ export async function waitForWork(scope: WaitScope, request: WaitRequest, deps: 
 
       if (request.userInputSignal?.aborted) return { kind: "user_input" };
       if (now() - startedAt >= request.timeoutMs) {
-        if (deps.hasSupervisorRequest?.()) return { kind: "supervisor_request" };
+        const supervisor = supervisorOutcome();
+        if (supervisor) return supervisor;
         const signal = deps.pendingSubagentSignal?.();
         if (signal) return { kind: "subagent_signal", signal };
         return { kind: "timeout" };

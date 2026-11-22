@@ -24,6 +24,7 @@ import {
 } from "./constants.ts";
 import { analyseCompletionPolicy } from "./notification-coordination.ts";
 import type { SubagentSignal } from "./subagent-signals.ts";
+import type { SupervisorRequestDetail } from "./supervisor-probe.ts";
 import { describeTerminal, formatDuration, waitForWork, type WaitOutcome } from "./wait-core.ts";
 import type { ActiveSubagentRun } from "./subagent-signals.ts";
 import { isTerminalStatus, type EventBusLike, type WaitTargetTask } from "./types.ts";
@@ -58,6 +59,8 @@ export interface UnifiedToolDeps {
   /** Names of providers seen in the last pi-subagents snapshot (fail-closed detection). */
   providers?: () => readonly string[];
   hasSupervisorRequest?: () => boolean;
+  /** The outstanding request from its file, so the closing sentence can name it. */
+  supervisorRequestDetail?: () => SupervisorRequestDetail | undefined;
   /**
    * A subagent signal captured during the wait (attention / intercom notice from another agent).
    * Native `bg_wait` never ends on one of these unless `stopOnAttention:true`, so the unified
@@ -346,6 +349,7 @@ export function createUnifiedToolRunner(deps: UnifiedToolDeps) {
           terminals: () => bridge.terminal(),
           ...(deps.providers ? { providers: deps.providers } : {}),
           ...(deps.hasSupervisorRequest ? { hasSupervisorRequest: deps.hasSupervisorRequest } : {}),
+          ...(deps.supervisorRequestDetail ? { supervisorRequestDetail: deps.supervisorRequestDetail } : {}),
           ...(deps.pendingSubagentSignal ? { pendingSubagentSignal: deps.pendingSubagentSignal } : {}),
           ...(deps.subscribe ? { subscribe: deps.subscribe } : {}),
           ...(deps.externalWake ? { externalWake: deps.externalWake } : {}),
@@ -451,6 +455,7 @@ export function createUnifiedToolRunner(deps: UnifiedToolDeps) {
         terminals: () => bridge.terminal(),
         ...(deps.providers ? { providers: deps.providers } : {}),
         ...(deps.hasSupervisorRequest ? { hasSupervisorRequest: deps.hasSupervisorRequest } : {}),
+        ...(deps.supervisorRequestDetail ? { supervisorRequestDetail: deps.supervisorRequestDetail } : {}),
         ...(deps.pendingSubagentSignal ? { pendingSubagentSignal: deps.pendingSubagentSignal } : {}),
         ...(deps.subscribe ? { subscribe: deps.subscribe } : {}),
         ...(deps.externalWake ? { externalWake: deps.externalWake } : {}),
@@ -572,9 +577,23 @@ function summarise(input: SummariseInput): UnifiedToolResult {
     case "user_input":
       lines.push(`Wait ended after ${formatDuration(input.elapsedMs)} because the user sent a new message. Work keeps running.`);
       break;
-    case "supervisor_request":
-      lines.push(`Wait ended after ${formatDuration(input.elapsedMs)} because a subagent needs a supervisor reply. Work keeps running.`);
+    case "supervisor_request": {
+      // The request id comes from the request file, not from the bus notice: it is the evidence
+      // that the directory was read (the notice itself lands ~130 ms before the file exists).
+      const request = input.outcome.request;
+      const facts: string[] = [];
+      if (request !== undefined) {
+        facts.push(`request ${request.requestId}`);
+        if (request.reason !== undefined) facts.push(`reason ${request.reason}`);
+        if (request.runId !== undefined) facts.push(`run ${request.runId}`);
+        if (request.agent !== undefined) facts.push(`from ${request.agent}`);
+      }
+      const detail = facts.length > 0 ? ` (${facts.join(", ")})` : "";
+      lines.push(
+        `Wait ended after ${formatDuration(input.elapsedMs)} because a subagent needs a supervisor reply${detail}. Work keeps running.`,
+      );
       break;
+    }
     case "subagent_signal": {
       const signal = input.outcome.signal;
       const detail = signal.message ? ` Signal: ${signal.message}.` : "";
