@@ -176,3 +176,35 @@ test("includeNative:false keeps the tool background-task-only", async () => {
   assert.match(result.text, /nothing to wait for/i, "an explicit opt-out keeps the old wording");
   h.bridge.dispose();
 });
+
+test("no background task but a live subagent: a signal ends the wait before its window", async () => {
+  // The reported case: `all:true` in a session whose only work is an async subagent. The native
+  // half owns the run scope and is blind to the three signals the operator requires, so this
+  // tool's own loop must stay alive beside it and end the wait. Before `holdEmptyScope` the
+  // empty background scope settled immediately and the wait could only end on its window.
+  const h = harness();
+  await h.bridge.refreshNow();
+  await until(() => h.bridge.owned());
+  let pending = true;
+  const runner = createUnifiedToolRunner({
+    bridge: h.bridge,
+    events: h.bus,
+    providers: () => [PROVIDER_NAME],
+    subscribe: (listener) => h.bridge.onChange(listener),
+    nativeWait: async () => "Waited 5.0s for 1 async run(s); timeout.",
+    pendingSubagentSignal: () =>
+      pending
+        ? undefined
+        : { kind: "attention", runId: "run-own", agent: "scout", source: "control-event", observedAt: Date.now() },
+  });
+  const started = Date.now();
+  const wait = runner({ all: true, timeoutMs: 3000 }, undefined, undefined, undefined);
+  await tick(60);
+  pending = false;
+  const result = await wait;
+  const elapsed = Date.now() - started;
+  assert.ok(elapsed < 2500, `a signal must end the wait early, not on its window (${String(elapsed)}ms)`);
+  assert.match(result.text, /needs attention in run run-own/i);
+  assert.match(result.text, /No background task of this session is running/i, "the empty background scope is still stated");
+  h.bridge.dispose();
+});

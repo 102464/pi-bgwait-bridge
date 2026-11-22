@@ -4,6 +4,11 @@
  * Reported failure: `bg_wait_unified({all:true})` returned after 7 ms with `attention required`
  * while the subagent was still working.
  *
+ * Since 2026-11-22 a notice observed *during* the wait does end it (operator requirement, see
+ * `scripts/live-signals.mjs`). What this script still guards is the other half of the rule: a
+ * notice that predates the wait must not cut it short, so the 25 s sleep lets the subagent trip
+ * the failure path first and the wait then has to run to the subagent's completion.
+ *
  * Cause: the tool forwarded `stopOnAttention:true`, and native `bg_wait` ends on *any*
  * `needs_attention` when that flag is true (subagent-wait.js:638). Ordinary attention sources
  * are an open tool at 240 s and three consecutive failing mutating tools
@@ -107,7 +112,7 @@ async function main() {
   record("pi exited 0", code === 0, `exit=${String(code)}`);
   record("model replied ATT_DONE", stdout.includes("ATT_DONE"));
   record(
-    "the wait did NOT end on a generic attention notice",
+    "a pre-existing notice does not end a fresh wait",
     !/attention required/i.test(unified),
     unified.replace(/\n/g, " | ").slice(0, 220),
   );

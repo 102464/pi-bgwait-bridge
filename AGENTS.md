@@ -38,7 +38,9 @@ suite fails.
 | Timeout ends the window, never the work | `src/wait-core.ts`, rows 12 |
 | Only typed streaming input aborts a wait | `test/extension.test.ts`, rows 9–10 |
 | A supervisor request ends a wait even with `stopOnAttention:false` | rows 8, `src/supervisor-probe.ts` |
-| A generic attention notice (open tool 240 s, 3 failed tools) never ends a wait | `test/mixed-scope-defaults.test.ts`, `test/supervisor-probe.test.ts` |
+| An attention notice, an intercom message, or a supervisor request observed **during** a wait ends it | `src/subagent-signals.ts`, `test/unified-wait.test.ts`, rows 8/10 |
+| A notice that predates the wait never ends it (no 7 ms early return) | `src/subagent-signals.ts#arm`, `test/unified-wait.test.ts` |
+| An empty background scope still ends on a signal while the native half runs | `src/wait-core.ts#holdEmptyScope`, `test/mixed-scope-defaults.test.ts` |
 | Provider disappearance fails closed | `src/wait-core.ts#providerLost` |
 | Notification flags are never rewritten and frames are never consumed | `src/notification-coordination.ts`, `test/notification-coordination.test.ts` |
 | Registration happens at load, so `bg_wait` is declared on the first turn | `extensions/bgwait-bridge.ts`, `test/extension.test.ts` |

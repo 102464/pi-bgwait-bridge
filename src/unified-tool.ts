@@ -16,13 +16,28 @@
 import type { Bridge, TerminalRecord } from "./bridge.ts";
 import {
   BG_TERMINAL_CHANNEL,
+  DEFAULT_POLL_MS,
   DEFAULT_TIMEOUT_MS,
   HOST_CHANGED_CHANNEL,
   SUBAGENT_CONTROL_CHANNEL,
+  SUBAGENT_CONTROL_INTERCOM_CHANNEL,
 } from "./constants.ts";
 import { analyseCompletionPolicy } from "./notification-coordination.ts";
+import type { SubagentSignal } from "./subagent-signals.ts";
 import { describeTerminal, formatDuration, waitForWork, type WaitOutcome } from "./wait-core.ts";
+import type { ActiveSubagentRun } from "./subagent-signals.ts";
 import { isTerminalStatus, type EventBusLike, type WaitTargetTask } from "./types.ts";
+
+/**
+ * Bus channels that can end this wait. Signals (attention, intercom) come from pi-subagents'
+ * own control events; `BG_TERMINAL_CHANNEL`/`HOST_CHANGED_CHANNEL` are ordinary task state.
+ */
+const SIGNAL_CHANNELS = [
+  BG_TERMINAL_CHANNEL,
+  HOST_CHANGED_CHANNEL,
+  SUBAGENT_CONTROL_CHANNEL,
+  SUBAGENT_CONTROL_INTERCOM_CHANNEL,
+];
 
 // The TypeBox parameter schema lives in `extensions/bgwait-bridge.ts`: `typebox` is a
 // host-provided import that Pi aliases, so the pure-TS runner stays dependency-free and
@@ -43,8 +58,29 @@ export interface UnifiedToolDeps {
   /** Names of providers seen in the last pi-subagents snapshot (fail-closed detection). */
   providers?: () => readonly string[];
   hasSupervisorRequest?: () => boolean;
+  /**
+   * A subagent signal captured during the wait (attention / intercom notice from another agent).
+   * Native `bg_wait` never ends on one of these unless `stopOnAttention:true`, so the unified
+   * wait owns the decision, and only for a run this session launched.
+   */
+  pendingSubagentSignal?: () => SubagentSignal | undefined;
+  /**
+   * Live async runs of this session, from pi-subagents' own run records. The progress line counts
+   * them: the native half's provider items cover only what native `bg_wait` contributes, so a
+   * subagent that is plainly still working would otherwise be reported as `0 async run(s)`.
+   */
+  activeRuns?: () => readonly ActiveSubagentRun[];
   /** Subscribe to local state changes (bridge.onChange). */
   subscribe?: (listener: () => void) => () => void;
+  /**
+   * Called on every wait tick with a `mutating` flag that turns true exactly once per wait.
+   *
+   * This is not part of the wait semantics. It exists because a live scenario has to act
+   * *during* a blocking wait (route an intercom ask from a sibling session, write a supervisor
+   * request file), and the progress tick is the only code that runs periodically inside the
+   * wait. Nothing is scheduled without a consumer opting in.
+   */
+  onProgress?: (state: { elapsedMs: number; active: readonly string[]; mutating: boolean }) => void;
   /**
    * Nested native `bg_wait` call. Session-wide calls include the subagent scope through it
    * by default (see `wantsNativeScope`): the native tool owns async runs, and background task
@@ -151,6 +187,24 @@ export function createUnifiedToolRunner(deps: UnifiedToolDeps) {
 
     let nativeNote = "";
     let nativePending: Promise<void> | undefined;
+    /**
+     * The native half's lifetime is deliberately shorter than its own window.
+     *
+     * Its window is `timeoutMs`, and by contract a timeout ends the window, never the work —
+     * so it would keep blocking for the whole window even after this tool has already decided
+     * to return (a signal that ended the wait, a settled selection, an unknown id). Without
+     * this the tool call stayed open for minutes after reporting its answer, which is exactly
+     * the "ended, but the call did not come back" shape of the reported bug.
+     */
+    let nativeReleased = false;
+    const nativeLifetime = new AbortController();
+    const abortNative = (): void => {
+      if (nativeLifetime.signal.aborted) return;
+      nativeReleased = true;
+      nativeLifetime.abort();
+    };
+    if (signal?.aborted === true) abortNative();
+    else signal?.addEventListener("abort", abortNative, { once: true });
     // Started before any early return so the subagent scope is still covered when this
     // session has no background task of its own (the post-reload case).
     const startNative = (): void => {
@@ -162,18 +216,55 @@ export function createUnifiedToolRunner(deps: UnifiedToolDeps) {
             stopOnAttention: nativeStopOnAttention,
             timeoutMs,
           },
-          signal,
+          nativeLifetime.signal,
           undefined,
         ),
       ).then(
         (text) => {
-          nativeNote = text ?? "";
+          const answer = text ?? "";
+          // The native half reports "Wait aborted" when this tool released it after its own
+          // answer; that is not an error, so it is not dressed up as one.
+          nativeNote = nativeReleased && /^\s*Wait aborted/i.test(answer)
+            ? "native bg_wait released when this wait ended, so the async-run scope keeps running."
+            : answer;
         },
         (error: unknown) => {
           nativeNote = `native bg_wait nested call failed: ${error instanceof Error ? error.message : String(error)}`;
         },
       );
     };
+
+    // One repaint per second, not one per poll tick: the renderer shows the same partial
+    // result, so a faster cadence is pure noise. Native `bg_wait`'s own live status
+    // (`asyncWaitUpdate`, subagent-wait.js:348-364) is the wording this mirrors.
+    const UPDATE_INTERVAL_MS = DEFAULT_POLL_MS;
+    let lastUpdateAt = -UPDATE_INTERVAL_MS;
+    let lastUpdateText = "";
+    let mutated = false;
+    const emitSignalProgress = (elapsedMs: number, providerItems: number, ownIds: number): void => {
+      // A live scenario may need to act *during* this wait (route an intercom ask, write a
+      // supervisor request file). This hook runs on every tick, so it is where such an action
+      // is scheduled; `mutating` is true once per wait.
+      const mutating = !mutated;
+      mutated = true;
+      if (onUpdate !== undefined && elapsedMs - lastUpdateAt >= UPDATE_INTERVAL_MS) {
+        const runs = deps.activeRuns?.() ?? [];
+        const signalCount = deps.pendingSubagentSignal ? 1 : 0;
+        const parts = [
+          `Waiting ${formatDuration(elapsedMs)} for ${String(runs.length + ownIds + signalCount)} async run(s) and ${String(providerItems)} provider item(s).`,
+          ...runs.flatMap((run) => [...run.activity]),
+          ...[...activeIdRef.value],
+        ].filter((part) => part.length > 0);
+        const text = parts.join(" · ");
+        if (text !== lastUpdateText) {
+          lastUpdateAt = elapsedMs;
+          lastUpdateText = text;
+          onUpdate({ text });
+        }
+      }
+      deps.onProgress?.({ elapsedMs, active: [...activeIdRef.value], mutating });
+    };
+    const activeIdRef: { value: readonly string[] } = { value: [] };
 
     const preTerminal = selection.preTerminal;
     // Only ids the bridge actually reports as active are waited on. An id that is neither
@@ -184,6 +275,7 @@ export function createUnifiedToolRunner(deps: UnifiedToolDeps) {
       (id) => knownActive.has(id) && !preTerminal.some((record) => record.id === id),
     );
     const unknownIds = selection.ids.filter((id) => !knownActive.has(id) && !preTerminal.some((record) => record.id === id));
+    activeIdRef.value = activeIds;
 
     // Already-terminal selection: answer immediately, exactly like native bg_wait does for a
     // finished run. `all` still needs the rest; `any` is already satisfied.
@@ -209,9 +301,42 @@ export function createUnifiedToolRunner(deps: UnifiedToolDeps) {
           : `No pi-background-tasks activation for this session is verified yet${bridge.lastError() ? ` (${bridge.lastError()})` : ""}; nothing to wait for.`;
         if (!useNative) return { text: noWork, failed: false, failedIds: [] };
         // No background task, but a session-wide wait still covers async subagents: delegate
-        // that scope to the native tool instead of claiming there is nothing to wait for.
+        // that scope to the native tool instead of claiming there is nothing to wait for — and
+        // keep this tool's own loop alive beside it, because the three signals the operator
+        // requires (attention, intercom, supervisor) are invisible to the native tool. Without
+        // the loop the reported case — `all:true` in a session whose work is an async subagent —
+        // would sit on the native half and never notice any of them.
         startNative();
-        await nativePending;
+        const emptyStartedAt = now();
+        const emptyOutcome = await waitForWork({ taskIds: [] }, { mode, timeoutMs, signal, userInputSignal, onTick: ({ elapsedMs }) => { emitSignalProgress(elapsedMs, 0, 0); }, holdEmptyScope: true }, {
+          events: deps.events,
+          now: deps.now,
+          activeIds: () => bridge.running().map((task) => task.id),
+          terminals: () => bridge.terminal(),
+          ...(deps.providers ? { providers: deps.providers } : {}),
+          ...(deps.hasSupervisorRequest ? { hasSupervisorRequest: deps.hasSupervisorRequest } : {}),
+          ...(deps.pendingSubagentSignal ? { pendingSubagentSignal: deps.pendingSubagentSignal } : {}),
+          ...(deps.subscribe ? { subscribe: deps.subscribe } : {}),
+          wakeChannels: SIGNAL_CHANNELS,
+        });
+        abortNative();
+        if (nativePending) await nativePending;
+        if (emptyOutcome.kind === "subagent_signal" || emptyOutcome.kind === "supervisor_request") {
+          const ended = summarise({
+            mode,
+            elapsedMs: now() - emptyStartedAt,
+            ids: [],
+            terminal,
+            preTerminal,
+            outcome: emptyOutcome,
+            missing: selection.missing,
+            failed: false,
+            failedIds: [],
+            nativeNote,
+          });
+          // `summarise` already appends the native note; adding it here too printed it twice.
+          return { ...ended, text: `No background task of this session is running.\n\n${ended.text}` };
+        }
         return {
           text: joinNotes("No background task of this session is running.", nativeNote || "Native wait returned no text."),
           failed: false,
@@ -232,6 +357,10 @@ export function createUnifiedToolRunner(deps: UnifiedToolDeps) {
     const startedAt = now();
     startNative();
 
+
+    // Progress cadence/wording come from `emitSignalProgress` above; the per-wait text differs
+    // only in the still-running ids it appends, which are this wait's own task ids.
+
     const outcome: WaitOutcome = await waitForWork(
       { taskIds: activeIds },
       {
@@ -239,10 +368,8 @@ export function createUnifiedToolRunner(deps: UnifiedToolDeps) {
         timeoutMs,
         signal,
         userInputSignal,
-        onTick: ({ elapsedMs, active }) => {
-          onUpdate?.({
-            text: `Waiting on ${String(active.length)} background task(s) for ${formatDuration(elapsedMs)}: ${active.join(", ")}`,
-          });
+        onTick: ({ elapsedMs }) => {
+          emitSignalProgress(elapsedMs, selection.preTerminal.length, 0);
         },
       },
       {
@@ -252,12 +379,18 @@ export function createUnifiedToolRunner(deps: UnifiedToolDeps) {
         terminals: () => bridge.terminal(),
         ...(deps.providers ? { providers: deps.providers } : {}),
         ...(deps.hasSupervisorRequest ? { hasSupervisorRequest: deps.hasSupervisorRequest } : {}),
+        ...(deps.pendingSubagentSignal ? { pendingSubagentSignal: deps.pendingSubagentSignal } : {}),
         ...(deps.subscribe ? { subscribe: deps.subscribe } : {}),
-        wakeChannels: [BG_TERMINAL_CHANNEL, HOST_CHANGED_CHANNEL, SUBAGENT_CONTROL_CHANNEL],
+        wakeChannels: SIGNAL_CHANNELS,
       },
     );
 
+    // This tool has its answer. Abort the native half instead of waiting out its window: the
+    // async-run scope it covers is already settled for this wait, and leaving it blocking
+    // would hold the tool call open long after the returned text.
+    abortNative();
     if (nativePending) await nativePending;
+    signal?.removeEventListener("abort", abortNative);
 
     const elapsedMs = now() - startedAt;
     const finalTerminal = bridge.terminal();
@@ -338,6 +471,27 @@ function summarise(input: SummariseInput): UnifiedToolResult {
     case "supervisor_request":
       lines.push(`Wait ended after ${formatDuration(input.elapsedMs)} because a subagent needs a supervisor reply. Work keeps running.`);
       break;
+    case "subagent_signal": {
+      const signal = input.outcome.signal;
+      const detail = signal.message ? ` Signal: ${signal.message}.` : "";
+      const reason = signal.reason ? ` (${signal.reason})` : "";
+      if (signal.kind === "intercom_ask") {
+        lines.push(
+          `Wait ended after ${formatDuration(input.elapsedMs)} because ${signal.agent} is waiting for a reply over intercom (ask ${signal.runId}). Work keeps running.`,
+        );
+        if (signal.question) lines.push("", "Intercom ask:", signal.question);
+        break;
+      }
+      lines.push(
+        signal.kind === "intercom"
+          ? `Wait ended after ${formatDuration(input.elapsedMs)} because ${signal.agent} sent an intercom message in run ${signal.runId}${reason}.${detail} Work keeps running.`
+          : `Wait ended after ${formatDuration(input.elapsedMs)} because ${signal.agent} needs attention in run ${signal.runId}${reason}.${detail} Work keeps running.`,
+      );
+      if (signal.kind === "intercom" && signal.intercomMessage) {
+        lines.push("", "Intercom notice:", signal.intercomMessage);
+      }
+      break;
+    }
     case "aborted":
       lines.push(`Wait aborted after ${formatDuration(input.elapsedMs)}.`);
       break;

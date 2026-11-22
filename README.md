@@ -144,7 +144,7 @@ Parameters:
 | `all` | every task running at wait start (plus async subagents — see below) |
 | `any` | return on the first terminal state |
 | `timeoutMs` | wait window; **never kills** the work |
-| `stopOnAttention` | **opt-in**, default `false`. A real subagent supervisor request always ends the wait; `true` additionally ends it on native attention notices (an open tool at 240 s, three consecutive tool failures) |
+| `stopOnAttention` | **opt-in**, default `false`. Attention notices, intercom messages and supervisor requests that appear *during* the wait always end it; `true` additionally lets native `bg_wait` end on a notice it sees first |
 | `includeNative` | `true` forces the subagent scope, `false` opts out |
 
 **Subagent scope.** A session-wide call (`all`, `any`, or no `ids`) also waits for async
@@ -185,15 +185,32 @@ them — and the wait result says so:
   the task keeps running.
 - **User input vs idle prompt.** Only *typed streaming* input (steer/follow-up) aborts a
   wait. Idle prompts and Goal-X's idle reminders never do.
+- **Three signals end the wait (operator requirement, 2026-11-22).** An attention notice from
+  a run of this session (`scout needs attention in run …`), an intercom message/ask another
+  agent routed here (`… is waiting for a reply over intercom (ask …)`, with the question
+  quoted), and a real `contact_supervisor` request (`… needs a supervisor reply`) all end
+  `bg_wait_unified` before its window, with `Work keeps running.` The work is never killed.
+  Sources: `src/subagent-signals.ts` (bus events, attributed to this session's runs by the
+  launching `sessionId` in `status.json`), `src/intercom-probe.ts` (pi-intercom's own
+  `pending-asks` ledger, because a steered intercom message is invisible while a blocking tool
+  holds the turn), `src/supervisor-probe.ts` (pi-subagents' request files).
+- **Only signals observed *during* the wait count.** A notice that predates the call does not
+  end it: a healthy child already marked `needs_attention` (e.g. an unread ask from an earlier
+  turn) must not cut a fresh wait short — that was the 7 ms `attention required` regression.
+- **A session with no background task still ends on a signal.** The native half owns the async
+  run scope there; this tool's own loop stays beside it (`holdEmptyScope`) so the signals are
+  seen. This is the reported case: `bg_wait_unified({all:true})` in a session whose only work
+  is an async subagent.
 
 ## Testing
 
 ```bash
-npm test                       # 90 unit tests, mock EventBus + controlled time
+npm test                       # 112 unit tests, mock EventBus + controlled time
 node scripts/live-e2e.mjs      # real pi process, real bg task, native bg_wait
 node scripts/live-mixed.mjs    # real subagent + real bg task, one native bg_wait
 node scripts/live-subagent-only.mjs  # only a subagent running: the unified wait must still wait
-node scripts/live-attention.mjs      # attention notices must not end the wait early
+node scripts/live-attention.mjs      # a healthy run's attention must not end the wait early
+node scripts/live-signals.mjs        # all three signals end the wait before its window (rpc mode)
 ```
 
 The live scripts need `pi` on `PATH` (or `PI_LAUNCHER=<path to pi-launcher.js>`), take

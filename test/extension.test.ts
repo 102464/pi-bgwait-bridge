@@ -8,6 +8,9 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { FakeBackgroundTaskHost, FakeEventBus, tick, until } from "./doubles.ts";
+import { mkdirSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
 
 interface FakePi {
   events: FakeEventBus;
@@ -222,3 +225,78 @@ test("launch provenance accepts task/tasks details from launcher tool results", 
   };
   assert.match(result.content[0]?.text ?? "", /bg-run-1 completed/i);
 });
+
+test("an intercom message from another agent ends an open unified wait", async () => {
+  const pi = fakePi();
+  const activate = await loadExtension();
+  activate(pi as never);
+  const host = new FakeBackgroundTaskHost(pi.events, { sessionId: "sess-A" });
+  const ctx = fakeContext("sess-A", "C:/sessions/A.jsonl");
+  await pi.emitTo("session_start", { reason: "startup" }, ctx);
+  host.upsert({ id: "bg-ic", name: "build", command: "npm run build", status: "running", startTime: 1, isAgent: false });
+  await tick(80);
+  const tool = pi.tools.find((entry) => entry.name === "bg_wait_unified");
+  assert.ok(tool);
+  const pending = tool.execute("call-ic", { all: true, timeoutMs: 4000 }, undefined, undefined, ctx) as Promise<unknown>;
+  await tick(60);
+  // The shape pi-intercom injects (`index.ts:1325-1340`): role "custom" + customType.
+  await pi.emitTo(
+    "message_end",
+    {
+      message: {
+        role: "custom",
+        customType: "intercom_message",
+        content: "**From scout** — need a decision on the SATA lane",
+        display: true,
+        details: { from: { id: "sess-child", name: "scout" }, message: { id: "msg-1", expectsReply: true } },
+      },
+    },
+    ctx,
+  );
+  const result = (await pending) as { content: { text: string }[] };
+  assert.match(result.content[0]?.text ?? "", /intercom message/i, result.content[0]?.text ?? "");
+  assert.match(result.content[0]?.text ?? "", /scout/i);
+  // The background task keeps running: a wait never kills work.
+  assert.deepEqual(host.tasks.map((entry) => entry.status), ["running"]);
+});
+
+test("an attention control event from this session's run ends an open unified wait", async () => {
+  const pi = fakePi();
+  const activate = await loadExtension();
+  activate(pi as never);
+  const host = new FakeBackgroundTaskHost(pi.events, { sessionId: "sess-A" });
+  const ctx = fakeContext("sess-A", "C:/sessions/A.jsonl");
+  await pi.emitTo("session_start", { reason: "startup" }, ctx);
+  host.upsert({ id: "bg-att", name: "build", command: "npm run build", status: "running", startTime: 1, isAgent: false });
+  await tick(80);
+  const tool = pi.tools.find((entry) => entry.name === "bg_wait_unified");
+  assert.ok(tool);
+  const pending = tool.execute("call-att", { all: true, timeoutMs: 4000 }, undefined, undefined, ctx) as Promise<unknown>;
+  await tick(60);
+  pi.events.emit("subagent:control-event", {
+    source: "async",
+    asyncDir: await ownedRunDir("sess-A"),
+    event: {
+      type: "needs_attention",
+      runId: "run-att",
+      agent: "rtl-engineer",
+      reason: "tool_open_threshold",
+      message: "rtl-engineer has had tool 'bash' open for 240s",
+      ts: 0,
+    },
+  });
+  const result = (await pending) as { content: { text: string }[] };
+  assert.match(result.content[0]?.text ?? "", /needs attention in run run-att/i, result.content[0]?.text ?? "");
+  assert.match(result.content[0]?.text ?? "", /has had tool 'bash' open for 240s/i);
+});
+
+/**
+ * A run directory owned by the given session: the capture attributes a control event by the
+ * launching `sessionId` in `status.json`, the same fact upstream uses (`requestMatchesOwner`).
+ */
+async function ownedRunDir(sessionId: string): Promise<string> {
+  const dir = path.join(tmpdir(), "bgw-ext-signals", `run-${String(Math.random()).slice(2)}`);
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(path.join(dir, "status.json"), JSON.stringify({ sessionId }), "utf8");
+  return dir;
+}

@@ -25,7 +25,7 @@ carries the row number and the original scenario text inline.
 | 7 | `all:false` 任意任务完成 | 正常提前返回 | `matrix.test.ts` row 7, `unified-wait.test.ts` |
 | 8 | Supervisor 请求 | 立即结束等待以便回复 | `matrix.test.ts` row 8 |
 | 9 | 用户输入 | 立即结束等待 | `matrix.test.ts` row 9, `extension.test.ts` |
-| 10 | 240 秒 idle 通知 | `stopOnAttention:false` 时不退出 | `matrix.test.ts` row 10 (replayed change-frame churn), `extension.test.ts` (idle `input` vs streaming `input`) |
+| 10 | 240 秒 idle 通知 / 任一 attention 通知 | 等待**期间**出现即结束等待（`subagent_signal`，文案点名 run 与 agent）；等待开始前已有的不结束 | `unified-wait.test.ts`（本会话新通知结束、外来 run 不结束、早于开始的旧通知不结束）、`matrix.test.ts` row 10 (replayed change-frame churn)、`extension.test.ts` |
 | 11 | bg_run 失败 | 正确报告失败 | `matrix.test.ts` row 11, `extension.test.ts` (`isError: true`) |
 | 12 | 等待超时 | 返回超时，后台工作继续 | `matrix.test.ts` row 12 |
 | 13 | 重复终态通知 | 不产生重复完成 | `matrix.test.ts` row 13, `bridge.test.ts` |
@@ -33,22 +33,22 @@ carries the row number and the original scenario text inline.
 | 15 | Goal-X 计时 | 等待期间继续增长 | `matrix.test.ts` row 15 (real wall-clock), `goalx.test.ts` (no surviving timers) |
 | 16 | Goal-X 自动继续 | 等待期间不空转 | `matrix.test.ts` row 16 (no self-rescheduling, one subscriber), `goalx.test.ts` (no message/turn injection) |
 
-Run records:
+Run records (reproduce locally; `evidence/` is in `.gitignore`, so the logs these
+commands write are per-machine observations and never committed):
 
-- `npm test` → **90 tests, 90 pass, 0 fail** (`evidence/unit-tests.log`)
-- `node scripts/live-e2e.mjs` → **10/10 live checks pass** (`evidence/live-e2e.log`)
-- `node scripts/live-mixed.mjs` → **9/9 live checks pass** (`evidence/live-mixed.log`)
-- `node scripts/live-subagent-only.mjs` → **5/5 live checks pass** (`evidence/live-subagent-only.log`)
+- `npm test` → **90 tests, 90 pass, 0 fail**
+- `node scripts/live-e2e.mjs` → **10/10 live checks pass**
+- `node scripts/live-mixed.mjs` → **9/9 live checks pass**
+- `node scripts/live-subagent-only.mjs` → **5/5 live checks pass**
   — the post-reload regression: only a subagent running, one `bg_wait_unified({all:true})`
-- `node scripts/live-attention.mjs` → **6/6 live checks pass** (`evidence/live-attention.log`)
+- `node scripts/live-attention.mjs` → **6/6 live checks pass**
   — the attention regression: a subagent tripping `needs_attention` must not end the wait
 - All four live scripts also pass with `--installed`, i.e. loaded from `settings.json`
-  (`evidence/live-e2e-installed.log`, `evidence/live-mixed-installed.log`,
-  `evidence/live-subagent-only-installed.log`, `evidence/live-attention-installed.log`)
 
 ### Not covered: extension load order
 
-`evidence/goalx-baseline.txt` records a **negative** result and is kept as a warning, not as
+A local baseline note (`evidence/goalx-baseline.txt`, written by hand and not committed)
+records a **negative** result and stands as a warning, not as
 proof. In a session that predates the install, native `bg_wait` still answers
 `No active async runs or registered provider work in this session. Nothing to wait for.`
 while a `bg_run` task is running: an already-running Pi process has the extension in
@@ -100,10 +100,16 @@ wait. Its ordinary sources (`runs/shared/subagent-control.js:9-12`) are an open 
 
 Rule now:
 
-| Call | Ends on a real supervisor request | Ends on a generic attention notice |
+| Call | Ends on a real supervisor request | Ends on an attention notice or intercom message |
 | --- | --- | --- |
-| default / `stopOnAttention:false` | yes (unconditional barrier, `subagent-wait.js:634-637`) | no |
-| `stopOnAttention:true` | yes | yes (native behaviour, explicit opt-in) |
+| default / `stopOnAttention:false` | yes — either the native barrier or `src/supervisor-probe.ts` | yes, when it appears **during** this wait (`src/subagent-signals.ts`) |
+| `stopOnAttention:true` | yes | yes — additionally lets native `bg_wait` end on it first |
+
+Wait-period rule (operator decision, 2026-11-22): a signal ends the wait only when it is observed
+*after* the wait armed. A healthy child that already carried `activityState: "needs_attention"`
+(e.g. an unread supervisor ask from an earlier turn) must not cut a fresh wait short — that was
+exactly the 7 ms `attention required` regression. Provider disappearance, a terminal task, user
+input and the window expiry keep their previous semantics.
 
 The unified wait's own loop no longer re-interprets the flag at all; it only forwards it to the
 native half. A real supervisor request is detected by `src/supervisor-probe.ts`, which reads
@@ -114,18 +120,38 @@ applies. An event-flag listener was rejected because a request is resolved in th
 (`subagent_supervisor({action:"reply"})`, :613-620) or in pi-subagents' own poll, so an outside
 observer could never learn it was answered and would latch "pending" forever.
 
-Covered by `test/mixed-scope-defaults.test.ts` (opt-in behaviour),
-`test/supervisor-probe.test.ts` (11 cases) and `scripts/live-attention.mjs` (real Pi: a
-subagent trips the failure path, the wait still runs ~44 s and ends `done`).
+Covered by `test/mixed-scope-defaults.test.ts` (opt-in behaviour, plus the empty-background-scope
+signal case), `test/supervisor-probe.test.ts` (11 cases), `test/unified-wait.test.ts` (signal
+rows), `test/intercom-probe.test.ts` (10 cases), and two live scripts: `scripts/live-attention.mjs`
+(a healthy run's notice must not cut the wait short before it is observed) and
+`scripts/live-signals.mjs` (all three signal classes, `--mode rpc`).
 
-## In-process verification (this session, after the fix)
+## Live verification of the three signals (2026-11-22)
 
-`evidence/in-process-live-verification.md` records 12 scenarios executed inside the Pi session
-that had the fixed extension loaded — two `bg_run` alone returning
+`node scripts/live-signals.mjs` runs each signal class in a real Pi session in `--mode rpc` — the
+only non-interactive mode that reports `hasUI: true`, which is what makes pi-intercom steer an
+inbound ask into a *busy* session instead of auto-answering and dismissing it
+(`pi-intercom/index.ts:1360-1384`). Each scenario asserts `waited_ms < timeoutMs`, i.e. the wait
+ended on the signal and not on its own window:
+
+| Signal | What produced it | Result |
+| --- | --- | --- |
+| intercom | a `pi-intercom` CLI process asking this session, 5 s after the wait began | ended after 6.3 s (window 90 s), text quotes the ask |
+| attention | sibling `scout` subagent tripping the repeated-failure path (`tool_failures`) | ended after 15.0 s (window 120 s), text names run + agent + reason |
+| contact_supervisor | sibling subagent calling `contact_supervisor({reason:"need_decision"})` | ended after 10.8 s (window 120 s), text says it is waiting for a supervisor reply |
+
+Logs go to `evidence/` (gitignored, per-machine). The four pre-existing live scripts (`live-e2e`,
+`live-mixed`, `live-subagent-only`, `live-attention`) and their `--installed` variants stay green.
+
+## In-process verification (earlier session, after the stopOnAttention fix)
+
+A local note (`evidence/in-process-live-verification.md`, written then and not committed) records
+12 scenarios run inside a Pi session with the fixed extension loaded: two `bg_run` alone returning
 `0 async run(s) and 2 provider item(s)` (no `No active async runs`), three bg tasks plus one
 subagent under `{all:true}`, `{any:true}` early return, exact ids, timeout-with-work-continuing,
-a generic attention notice not ending the wait, and a real supervisor request ending it in 8 s
-while a 40 s bg task kept running.
+and a real supervisor request ending it in 8 s while a 40 s bg task kept running. One row of that
+note described the *previous* rule (a generic attention notice not ending the wait); the rule is
+now "a signal observed during the wait ends it", per the operator decision above.
 
 ## Platform support
 

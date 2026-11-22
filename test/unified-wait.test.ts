@@ -8,18 +8,28 @@
  * finishes first") are deterministic.
  */
 import assert from "node:assert/strict";
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import { test } from "node:test";
 import { createBridge } from "../src/bridge.ts";
 import { PROVIDER_NAME } from "../src/constants.ts";
+import { createSubagentSignalCapture, type SubagentSignal } from "../src/subagent-signals.ts";
 import { createUnifiedToolRunner } from "../src/unified-tool.ts";
 import { FakeBackgroundTaskHost, FakeEventBus, tick, until } from "./doubles.ts";
 import type { DoubleTask } from "./doubles.ts";
-import type { WaitTargetTask } from "../src/types.ts";
 
 interface HarnessOptions {
   /** Extra ids that behave like async subagents still running. */
   subagentActive?: () => string[];
   supervisor?: () => boolean;
+  /**
+   * Wire a signal capture built on this harness's own bus (it must be the same bus the wait
+   * subscribes to). The setup arms the capture and returns the predicate plus a disarm.
+   */
+  signalSetup?: (bus: FakeEventBus) => { signal: () => SubagentSignal | undefined; off: () => void };
+  /** Live async runs of this session, as pi-subagents' own run records would report them. */
+  activeRuns?: () => readonly { runId: string; activity: readonly string[] }[];
 }
 
 function harness(options: HarnessOptions = {}) {
@@ -31,14 +41,17 @@ function harness(options: HarnessOptions = {}) {
     refreshMs: 500,
     requestTimeoutMs: 400,
   });
+  const armed = options.signalSetup?.(bus);
   const runner = createUnifiedToolRunner({
     bridge,
     events: bus,
     providers: () => [PROVIDER_NAME],
     ...(options.supervisor ? { hasSupervisorRequest: options.supervisor } : {}),
+    ...(armed ? { pendingSubagentSignal: armed.signal } : {}),
+    ...(options.activeRuns ? { activeRuns: options.activeRuns } : {}),
     subscribe: (listener) => bridge.onChange(listener),
   });
-  return { bus, host, bridge, runner };
+  return { bus, host, bridge, runner, armed };
 }
 
 function task(id: string, overrides: Partial<DoubleTask> = {}): DoubleTask {
@@ -300,14 +313,234 @@ test("mixed scope: background task finishing first keeps the subagent scope open
   h.bridge.dispose();
 });
 
-test("onTick progress is emitted while waiting", async () => {
+test("onTick progress is emitted while waiting, throttled to one second, in native wording", async () => {
   const h = harness();
   await start(h, ["bg-tick"]);
-  const seen: string[] = [];
-  const pending = h.runner({ all: true, timeoutMs: 300 }, undefined, undefined, (update) => seen.push(update.text));
+  const seen: { text: string; at: number }[] = [];
+  const pending = h.runner({ all: true, timeoutMs: 1600 }, undefined, undefined, (update) => seen.push({ text: update.text, at: Date.now() }));
   const result = await pending;
   assert.ok(seen.length > 0, "progress updates must reach onUpdate");
-  assert.match(seen[0] ?? "", /Waiting on 1 background task/i);
+  // Native shape (`asyncWaitUpdate`, subagent-wait.js:348-364): elapsed + run/provider counts.
+  assert.match(seen[0]?.text ?? "", /^Waiting .+ for \d+ async run\(s\) and \d+ provider item\(s\)\. · bg-tick$/);
+  // One repaint per second, not one per 250 ms poll tick: the renderer shows the same partial text.
+  const gaps = seen.slice(1).map((entry, index) => entry.at - seen[index]!.at);
+  for (const gap of gaps) assert.ok(gap >= 900, `updates must be ~1s apart, got ${String(gap)}ms`);
   assert.match(result.text, /Wait window elapsed/i);
+  h.bridge.dispose();
+});
+
+// ---- progress wording: async-run count comes from the run records -------------------------
+
+test("the progress line counts live async runs from the run records, in native wording", async () => {
+  const h = harness({
+    activeRuns: () => [
+      { runId: "run-own", activity: ["scout: bash"] },
+      { runId: "run-two", activity: ["rtl-engineer: edit"] },
+    ],
+  });
+  await start(h, ["bg-tick"]);
+  const seen: string[] = [];
+  const pending = h.runner({ all: true, timeoutMs: 1600 }, undefined, undefined, (update) => seen.push(update.text));
+  const result = await pending;
+  assert.ok(seen.length > 0, "progress updates must reach onUpdate");
+  // Native shape (`asyncWaitUpdate`, subagent-wait.js:348-364): the headline carries the live
+  // async-run count and the per-run `agent: tool` activity after a ` · ` separator.
+  assert.match(seen[0] ?? "", /^Waiting .+ for 2 async run\(s\) and 0 provider item\(s\)\. \u00b7 scout: bash \u00b7 rtl-engineer: edit \u00b7 bg-tick$/);
+  assert.match(result.text, /Wait window elapsed/i);
+  h.bridge.dispose();
+});
+
+test("a session with no live async run reports 0 async run(s), never a made-up count", async () => {
+  const h = harness({ activeRuns: () => [] });
+  await start(h, ["bg-zero"]);
+  const seen: string[] = [];
+  await h.runner({ all: true, timeoutMs: 1200 }, undefined, undefined, (update) => seen.push(update.text));
+  assert.match(seen[0] ?? "", /^Waiting .+ for 0 async run\(s\) and 0 provider item\(s\)\. \u00b7 bg-zero$/);
+  h.bridge.dispose();
+});
+
+test("activeRuns reads only this session's runs, and only live states", () => {
+  const root = path.join(tmpdir(), "bgw-active-runs");
+  rmSync(root, { recursive: true, force: true });
+  const runsRoot = path.join(root, "async-subagent-runs");
+  const writeRun = (name: string, status: Record<string, unknown>): void => {
+    mkdirSync(path.join(runsRoot, name), { recursive: true });
+    writeFileSync(path.join(runsRoot, name, "status.json"), JSON.stringify(status), "utf8");
+  };
+  writeRun("run-live", { runId: "run-live", sessionId: "C:/sessions/A.jsonl", state: "running", steps: [{ agent: "scout", status: "running", currentTool: "bash" }] });
+  writeRun("run-queued", { runId: "run-queued", sessionId: "sess-A", state: "queued", steps: [{ agent: "planner", status: "pending" }] });
+  writeRun("run-done", { runId: "run-done", sessionId: "sess-A", state: "complete", steps: [{ agent: "scout", status: "complete" }] });
+  writeRun("run-foreign", { runId: "run-foreign", sessionId: "C:/sessions/OTHER.jsonl", state: "running", steps: [{ agent: "scout", status: "running" }] });
+  const capture = createSubagentSignalCapture({
+    events: new FakeEventBus(),
+    sessionIds: () => ["sess-A", "C:/sessions/A.jsonl"],
+    tempRoot: root,
+  });
+  const runs = capture.activeRuns();
+  assert.deepEqual(runs.map((run) => run.runId), ["run-live", "run-queued"], "only live states of this session");
+  assert.deepEqual(runs[0]?.activity, ["scout: bash"], "a running step shows its live tool");
+  assert.deepEqual(runs[1]?.activity, ["planner: queued"], "a pending step reads queued, like native");
+});
+
+// ---- attention / intercom signals ------------------------------------------------------------
+//
+// Operator requirement (2026-11-22): an attention notice, and an intercom message another agent
+// sends to this session, end the wait — not only a supervisor request. These rows drive the real
+// capture (`src/subagent-signals.ts`) over the harness's own bus, with real run directories whose
+// `status.json` carries the launching `sessionId`.
+
+function writeRunDir(dir: string, sessionId: string): void {
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(path.join(dir, "status.json"), JSON.stringify({ runId: path.basename(dir), sessionId }), "utf8");
+}
+
+const SIGNAL_ROOT = path.join(tmpdir(), "bgw-signals");
+const OWNED_DIR = path.join(SIGNAL_ROOT, "run-own");
+const FOREIGN_DIR = path.join(SIGNAL_ROOT, "run-foreign");
+
+/** Arm a capture on the harness's own bus and hand its predicate to the runner. */
+function armSignals(bus: FakeEventBus) {
+  let seen: SubagentSignal | undefined;
+  const capture = createSubagentSignalCapture({
+    events: bus,
+    sessionIds: () => ["sess-A", "C:/sessions/A.jsonl"],
+  });
+  return {
+    arm(): { signal: () => SubagentSignal | undefined; off: () => void } {
+      const off = capture.arm(() => {
+        seen = capture.pending();
+      });
+      return { signal: () => seen, off };
+    },
+  };
+}
+
+function attentionPayload(asyncDir: string, overrides: Record<string, unknown> = {}) {
+  return {
+    source: "async",
+    asyncDir,
+    noticeText: "Subagent needs attention: scout",
+    event: {
+      type: "needs_attention",
+      runId: path.basename(asyncDir),
+      agent: "scout",
+      reason: "tool_failures",
+      message: "scout failed 3 mutating tools in a row",
+      ts: 0,
+      ...overrides,
+    },
+  };
+}
+
+test("an attention notice from this session's run ends the wait", async () => {
+  writeRunDir(OWNED_DIR, "C:/sessions/A.jsonl");
+  const h = harness();
+  const armed = armSignals(h.bus).arm();
+  const runner = createUnifiedToolRunner({
+    bridge: h.bridge,
+    events: h.bus,
+    providers: () => [PROVIDER_NAME],
+    pendingSubagentSignal: armed.signal,
+    subscribe: (listener) => h.bridge.onChange(listener),
+  });
+  await start(h, ["bg-att"]);
+  const pending = runner({ all: true, timeoutMs: 5000 }, undefined, undefined, undefined);
+  await tick(40);
+  h.bus.emit("subagent:control-event", attentionPayload(OWNED_DIR));
+  const result = await pending;
+  assert.match(result.text, /needs attention in run run-own/i, result.text);
+  assert.match(result.text, /scout failed 3 mutating tools in a row/i, "the upstream signal line is reported");
+  assert.deepEqual(h.bridge.running().map((entry) => entry.id), ["bg-att"], "work keeps running");
+  armed.off();
+  h.bridge.dispose();
+});
+
+test("an attention notice from another session's run does not end this wait", async () => {
+  writeRunDir(FOREIGN_DIR, "C:/sessions/OTHER.jsonl");
+  const h = harness();
+  const armed = armSignals(h.bus).arm();
+  const runner = createUnifiedToolRunner({
+    bridge: h.bridge,
+    events: h.bus,
+    providers: () => [PROVIDER_NAME],
+    pendingSubagentSignal: armed.signal,
+    subscribe: (listener) => h.bridge.onChange(listener),
+  });
+  await start(h, ["bg-foreign"]);
+  const pending = runner({ all: true, timeoutMs: 600 }, undefined, undefined, undefined);
+  await tick(40);
+  h.bus.emit("subagent:control-event", attentionPayload(FOREIGN_DIR));
+  const result = await pending;
+  assert.match(result.text, /Wait window elapsed/i, "a foreign run's notice must not end this session's wait");
+  armed.off();
+  h.bridge.dispose();
+});
+
+test("an intercom message another agent routed here ends the wait", async () => {
+  writeRunDir(OWNED_DIR, "C:/sessions/A.jsonl");
+  const h = harness();
+  const armed = armSignals(h.bus).arm();
+  const runner = createUnifiedToolRunner({
+    bridge: h.bridge,
+    events: h.bus,
+    providers: () => [PROVIDER_NAME],
+    pendingSubagentSignal: armed.signal,
+    subscribe: (listener) => h.bridge.onChange(listener),
+  });
+  await start(h, ["bg-ic"]);
+  const pending = runner({ all: true, timeoutMs: 5000 }, undefined, undefined, undefined);
+  await tick(40);
+  h.bus.emit("subagent:control-intercom", {
+    ...attentionPayload(OWNED_DIR, { reason: "supervisor_request" }),
+    to: "orchestrator",
+    message: "Subagent needs attention\n\nscout is waiting for a supervisor reply",
+  });
+  const result = await pending;
+  assert.match(result.text, /sent an intercom message in run run-own/i, result.text);
+  assert.match(result.text, /waiting for a supervisor reply/i);
+  armed.off();
+  h.bridge.dispose();
+});
+
+test("a notice observed before the wait began never ends it", async () => {
+  writeRunDir(OWNED_DIR, "C:/sessions/A.jsonl");
+  const h = harness();
+  // The notice fires before this tool call exists — the shape of the `attention required`
+  // 7 ms premature return: attention that was already true when the wait started.
+  h.bus.emit("subagent:control-event", attentionPayload(OWNED_DIR, { message: "stale attention" }));
+  const armed = armSignals(h.bus).arm();
+  assert.equal(armed.signal(), undefined, "arming is the boundary: earlier notices are not new work");
+  await start(h, ["bg-stale"]);
+  const runner = createUnifiedToolRunner({
+    bridge: h.bridge,
+    events: h.bus,
+    providers: () => [PROVIDER_NAME],
+    pendingSubagentSignal: armed.signal,
+    subscribe: (listener) => h.bridge.onChange(listener),
+  });
+  const result = await runner({ all: true, timeoutMs: 600 }, undefined, undefined, undefined);
+  assert.match(result.text, /Wait window elapsed/i, "a stale notice must not cut a fresh wait short");
+  armed.off();
+  h.bridge.dispose();
+});
+
+test("an active_long_running notice is progress, not a signal", () => {
+  writeRunDir(OWNED_DIR, "C:/sessions/A.jsonl");
+  const h = harness();
+  const armed = armSignals(h.bus).arm();
+  h.bus.emit("subagent:control-event", attentionPayload(OWNED_DIR, { type: "active_long_running" }));
+  assert.equal(armed.signal(), undefined);
+  armed.off();
+  h.bridge.dispose();
+});
+
+test("disarming removes the bus listeners", () => {
+  const h = harness();
+  const armed = armSignals(h.bus).arm();
+  assert.equal(h.bus.listenerCount("subagent:control-event"), 1);
+  assert.equal(h.bus.listenerCount("subagent:control-intercom"), 1);
+  armed.off();
+  assert.equal(h.bus.listenerCount("subagent:control-event"), 0, "no listener outlives the call");
+  assert.equal(h.bus.listenerCount("subagent:control-intercom"), 0);
   h.bridge.dispose();
 });

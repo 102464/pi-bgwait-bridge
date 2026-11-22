@@ -22,7 +22,9 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { createBridge, type Bridge, type ProviderContext } from "../src/bridge.ts";
 import { BG_TERMINAL_CHANNEL, HOST_CHANGED_CHANNEL, PROVIDER_NAME } from "../src/constants.ts";
+import { createIntercomProbe } from "../src/intercom-probe.ts";
 import { registerProviderSync, upgradeToOfficial, type ProviderShape, type RegisterResult } from "../src/provider-registry.ts";
+import { createSubagentSignalCapture, type SubagentSignalCapture } from "../src/subagent-signals.ts";
 import { createUnifiedToolRunner } from "../src/unified-tool.ts";
 import { createSupervisorProbe } from "../src/supervisor-probe.ts";
 import type { WaitTargetTask } from "../src/types.ts";
@@ -51,10 +53,10 @@ const BgWaitUnifiedParams = {
     },
     any: { type: "boolean", description: "Return as soon as one selected task reaches a terminal state." },
     timeoutMs: { type: "number", description: "Wait window; the work keeps running afterwards." },
-    stopOnAttention: {
+        stopOnAttention: {
       type: "boolean",
       description:
-        "Default: only a real subagent supervisor request ends the wait; ordinary attention notices (long-running tool, repeated tool failures) do not. Pass true to also stop on those notices, matching native bg_wait's own default.",
+        "Default: attention notices and intercom messages from a subagent of this session end the wait, and so does a real supervisor request. Pass true to also let the native bg_wait end on any attention notice before this tool observes it.",
     },
     includeNative: {
       type: "boolean",
@@ -97,6 +99,13 @@ export default function activate(pi: ExtensionAPI): void {
   const seenProviders = new Set<string>();
   /** One AbortController per in-flight unified wait, aborted by typed streaming input. */
   const waitControllers = new Map<string, AbortController>();
+  /**
+   * Signal captures of the waits currently in flight. `intercom({action:"ask"})` from another
+   * agent is delivered as a `customType:"intercom_message"` message
+   * (pi-intercom `index.ts:1325-1340`) and emits no control event, so the wait can only learn
+   * about it from Pi's own message stream.
+   */
+  const activeCaptures = new Set<SubagentSignalCapture>();
 
   const identityOf = (ctx: ExtensionContext): Identity => ({
     sessionId: ctx.sessionManager.getSessionId(),
@@ -201,6 +210,25 @@ export default function activate(pi: ExtensionAPI): void {
     runtime.bridge.refresh();
   });
 
+  /**
+   * Another agent's intercom message is a blocking ask for this session: end the wait so it can
+   * be read. Pi marks these messages `role:"custom"`, `customType:"intercom_message"`; a
+   * capture ignores anything it observed before its wait was armed, so a backlog is not new work.
+   */
+  pi.on("message_end", (event) => {
+    const message = (event as { message?: unknown }).message;
+    if (!message || typeof message !== "object") return;
+    const record = message as { role?: unknown; customType?: unknown; details?: unknown; content?: unknown };
+    if (record.role !== "custom") return;
+    for (const capture of activeCaptures) {
+      capture.observeIntercomMessage({
+        customType: record.customType,
+        details: record.details,
+        content: record.content,
+      });
+    }
+  });
+
   pi.registerTool({
     name: "bg_wait_unified",
     label: "Unified Background Wait",
@@ -228,7 +256,38 @@ export default function activate(pi: ExtensionAPI): void {
             (value): value is string => typeof value === "string" && value.length > 0,
           ),
       });
+      /**
+       * The other two signal classes: an attention notice, and an intercom message another
+       * agent routed here. Both are captured from pi-subagents' own control-event bus during
+       * this wait only, attributed to a run of this session by its launch `sessionId`.
+       */
+      const signals = createSubagentSignalCapture({
+        events: pi.events,
+        sessionIds: () =>
+          [runtime.identity.sessionFile, runtime.identity.sessionId].filter(
+            (value): value is string => typeof value === "string" && value.length > 0,
+          ),
+        /**
+         * The durable half of an intercom message: pi-intercom addresses a session by its
+         * intercom id (`resolveConfiguredIntercomSessionId`, index.ts:596-598), which it
+         * publishes into `PI_INTERCOM_SESSION_ID` at session start — read lazily because the
+         * extension loads before that. A steered ask is invisible while this tool blocks the
+         * turn (`agent-session.js:1967-1975` only queues it), so the ledger record is the
+         * only evidence a wait can see.
+         */
+        pendingAsk: () => {
+          const ids = [process.env["PI_INTERCOM_SESSION_ID"], runtime.identity.sessionId].filter(
+            (value): value is string => typeof value === "string" && value.length > 0,
+          );
+          return createIntercomProbe({ sessionIds: () => ids }).pending();
+        },
+      });
+      let armed: (() => void) | undefined;
       try {
+        // Armed before the wait begins and cleared in `finally`: a notice that fired before
+        // this call is not new work, and no listener outlives the tool call.
+        armed = signals.arm(() => {});
+        activeCaptures.add(signals);
         const runner = createUnifiedToolRunner({
           bridge: runtime.bridge,
           events: pi.events,
@@ -237,6 +296,15 @@ export default function activate(pi: ExtensionAPI): void {
           // The probe reads pi-subagents' own request files, the same data `requestMatchesOwner`
           // uses, so a request answered in an earlier turn is not counted again.
           hasSupervisorRequest: () => supervisor.hasPending(),
+          /**
+           * Attention / intercom signals end this wait too (operator requirement). The capture
+           * is armed on the first tick, so a stale notice that fired before the call is not
+           * treated as new work (that is the `attention required` premature-return regression).
+           */
+          pendingSubagentSignal: () => signals.pending(),
+          // Live async runs of this session: the progress line counts them, so it cannot print
+          // `0 async run(s)` while a subagent of this session is plainly still working.
+          activeRuns: () => signals.activeRuns(),
           subscribe: (listener) => runtime.bridge.onChange(listener),
           nativeWait: async (waitParams, nestedSignal) => {
             if (!pi.getAllTools().some((tool) => tool.name === "bg_wait")) {
@@ -245,8 +313,12 @@ export default function activate(pi: ExtensionAPI): void {
             const outcome = await ctx.executeTool("bg_wait", waitParams, { signal: nestedSignal });
             const text = textOf(outcome);
             // The native tool can be blocked or disabled; its no-work answer must not be
-            // reported as a completed subagent wait.
+            // reported as a completed subagent wait. An abort this tool caused by returning
+            // its own answer is not a failure: the async scope simply keeps running.
             if ((outcome as { isError?: boolean } | undefined)?.isError === true) {
+              if (nestedSignal?.aborted === true && /^\s*Wait aborted/i.test(text)) {
+                return "native bg_wait released when this wait ended, so the async-run scope keeps running.";
+              }
               return `native bg_wait failed: ${text}`;
             }
             return text;
@@ -266,6 +338,8 @@ export default function activate(pi: ExtensionAPI): void {
           ...(result.failed ? { isError: true } : {}),
         };
       } finally {
+        activeCaptures.delete(signals);
+        armed?.();
         waitControllers.delete(toolCallId);
       }
     },

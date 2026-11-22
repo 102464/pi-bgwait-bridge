@@ -5,13 +5,17 @@
  *  - Never blocks the Node event loop: one Promise, woken by EventBus channels, a poll
  *    fallback, an abort signal, and a user-input signal.
  *  - Timeout ends the wait window only; it never kills the work.
- *  - Supervisor asks and typed user input end the wait with a distinct outcome.
- *  - Generic "attention" notices (an open tool at 240 s, repeated tool failures) never end
- *    this wait. Native `bg_wait` only ends on those when the caller opts in with
- *    `stopOnAttention:true` (subagent-wait.js:638), and that flag is forwarded to the native
- *    half untouched; it is not re-interpreted here.
+ *  - Supervisor asks, subagent attention notices, other-agent intercom notices and typed
+ *    user input end the wait with a distinct outcome (operator requirement, 2026-11-22).
+ *    The signals themselves are decided by the caller (`pendingSubagentSignal`), because
+ *    ownership and "observed during this wait" have to be established from pi-subagents'
+ *    own files; this loop only consumes the verdict.
+ *  - Native `bg_wait` ends on attention only with `stopOnAttention:true` (subagent-wait.js:638)
+ *    and never on an intercom notice that is not attention, which is exactly the gap the
+ *    caller-side signal covers. The flag is still forwarded untouched and not re-interpreted.
  */
 import type { TerminalRecord } from "./bridge.ts";
+import type { SubagentSignal } from "./subagent-signals.ts";
 import { DEFAULT_POLL_MS, MIN_POLL_MS } from "./constants.ts";
 import { isActiveStatus, isTerminalStatus, type EventBusLike, type WaitTargetTask } from "./types.ts";
 
@@ -21,6 +25,7 @@ export type WaitOutcome =
   | { kind: "aborted"; reason: string }
   | { kind: "user_input" }
   | { kind: "supervisor_request" }
+  | { kind: "subagent_signal"; signal: SubagentSignal }
   | { kind: "provider_disappeared"; provider: string };
 
 export interface WaitScope {
@@ -42,6 +47,8 @@ export interface WaitDeps {
   providers?: () => readonly string[];
   /** True when a subagent supervisor request is outstanding. */
   hasSupervisorRequest?: () => boolean;
+  /** A subagent signal observed during this wait that must end it (attention / intercom). */
+  pendingSubagentSignal?: () => SubagentSignal | undefined;
   /** Wakes the loop on state change; returns an unsubscribe. */
   subscribe?: (listener: () => void) => () => void;
   /** Channels that should wake the loop. */
@@ -56,6 +63,16 @@ export interface WaitRequest {
   signal?: AbortSignal | undefined;
   userInputSignal?: AbortSignal | undefined;
   onTick?: (state: { elapsedMs: number; active: string[]; finished: string[] }) => void;
+  /**
+   * Keep waiting even when this scope holds no id of its own.
+   *
+   * A session with no background task but a live async subagent delegates the run scope to the
+   * native `bg_wait`; this loop then exists only to end the wait on a signal the native tool
+   * cannot see (an attention notice, an intercom message, a supervisor ask). Without it, an
+   * `all:true` call in exactly the post-reload case the operator reported would sit on the
+   * native half and never observe those signals.
+   */
+  holdEmptyScope?: boolean;
 }
 
 function sleep(ms: number, signal?: AbortSignal): Promise<void> {
@@ -126,6 +143,8 @@ export async function waitForWork(scope: WaitScope, request: WaitRequest, deps: 
 
     const isDone = (): WaitOutcome | undefined => {
       if (deps.hasSupervisorRequest?.()) return { kind: "supervisor_request" };
+      const signal = deps.pendingSubagentSignal?.();
+      if (signal) return { kind: "subagent_signal", signal };
       if (request.signal?.aborted) return { kind: "aborted", reason: "signal" };
       const active = stillActive();
       const done = finished();
@@ -134,7 +153,10 @@ export async function waitForWork(scope: WaitScope, request: WaitRequest, deps: 
         if (initialIds.size === 0) return { kind: "settled", reason: "any" };
         return undefined;
       }
-      if (active.length === 0) return { kind: "settled", reason: "all" };
+      if (active.length === 0) {
+        if (request.holdEmptyScope === true && initialIds.size === 0) return undefined;
+        return { kind: "settled", reason: "all" };
+      }
       return undefined;
     };
 
@@ -160,6 +182,8 @@ export async function waitForWork(scope: WaitScope, request: WaitRequest, deps: 
       if (request.userInputSignal?.aborted) return { kind: "user_input" };
       if (now() - startedAt >= request.timeoutMs) {
         if (deps.hasSupervisorRequest?.()) return { kind: "supervisor_request" };
+        const signal = deps.pendingSubagentSignal?.();
+        if (signal) return { kind: "subagent_signal", signal };
         return { kind: "timeout" };
       }
 
