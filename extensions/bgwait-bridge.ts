@@ -24,6 +24,7 @@ import { createBridge, type Bridge, type ProviderContext } from "../src/bridge.t
 import { BG_TERMINAL_CHANNEL, HOST_CHANGED_CHANNEL, PROVIDER_NAME } from "../src/constants.ts";
 import { registerProviderSync, upgradeToOfficial, type ProviderShape, type RegisterResult } from "../src/provider-registry.ts";
 import { createUnifiedToolRunner } from "../src/unified-tool.ts";
+import { createSupervisorProbe } from "../src/supervisor-probe.ts";
 import type { WaitTargetTask } from "../src/types.ts";
 
 /**
@@ -53,12 +54,12 @@ const BgWaitUnifiedParams = {
     stopOnAttention: {
       type: "boolean",
       description:
-        "Default true. A pending subagent supervisor request ends the wait; ordinary idle reminders never do.",
+        "Default: only a real subagent supervisor request ends the wait; ordinary attention notices (long-running tool, repeated tool failures) do not. Pass true to also stop on those notices, matching native bg_wait's own default.",
     },
     includeNative: {
       type: "boolean",
       description:
-        "Also wait for async subagent runs by nesting one native bg_wait call. Off by default because the native tool already covers that scope.",
+        "Wait for async subagent runs too. Default: true for session-wide calls (all / any / no ids) and false when exact ids are given; false here opts out entirely.",
     },
   },
   additionalProperties: false,
@@ -204,12 +205,13 @@ export default function activate(pi: ExtensionAPI): void {
     name: "bg_wait_unified",
     label: "Unified Background Wait",
     description:
-      "Wait for this session's native pi-background-tasks work (bg_run and the other bg_* launchers), by exact task id or across every running task, optionally together with pi-subagents async runs. Native bg_wait covers aggregate provider work; this tool adds exact ids, mixed scope, and per-task failure reporting. A timeout ends the wait window only; the work keeps running.",
+      "Wait for this session's native pi-background-tasks work (bg_run and the other bg_* launchers) together with pi-subagents async runs. Pass ids for exact background task ids, or all/any/none for the whole session; a session-wide call also waits for async subagents through the native bg_wait. Native bg_wait alone covers aggregate provider work; this tool adds exact ids, mixed scope, and per-task failure reporting. A timeout ends the wait window only; the work keeps running.",
     promptSnippet:
-      "Wait for native background tasks of this session (exact ids or all running), mixed with async subagents; per-task failure results",
+      "Wait for this session's background work: exact background task ids, or the whole session (background tasks plus async subagents); per-task failure results",
     promptGuidelines: [
       "Use bg_wait_unified when you need to wait for a specific bg_run task id, or for a mix of bg_run tasks and async subagents in one blocking call.",
-      "Pass ids for exact tasks, or all:true to wait for every background task running when the wait starts. any:true returns on the first terminal state.",
+      "Pass ids for exact background tasks, or all:true to wait for every background task running when the wait starts plus any async subagent. any:true returns on the first terminal state.",
+      "A session-wide call with no ids (all/any) also waits for async subagents, so it is safe to call right after a reload when only a subagent is running.",
       "The wait window ends without killing anything; call again to keep waiting. A failed or killed task is reported as a failure, never as success.",
       "For tasks a unified wait will cover, launch with notifyOnCompletion:true and triggerOnCompletion:false so completion does not also start a second agent turn.",
     ],
@@ -218,18 +220,36 @@ export default function activate(pi: ExtensionAPI): void {
       const runtime = runtimeFor(ctx);
       const controller = new AbortController();
       waitControllers.set(toolCallId, controller);
+      // One probe per call so its 250 ms cache is actually used: the wait loop asks this
+       // question on every tick, and a fresh probe per tick would rescan the channel root.
+      const supervisor = createSupervisorProbe({
+        sessionIds: () =>
+          [runtime.identity.sessionFile, runtime.identity.sessionId].filter(
+            (value): value is string => typeof value === "string" && value.length > 0,
+          ),
+      });
       try {
         const runner = createUnifiedToolRunner({
           bridge: runtime.bridge,
           events: pi.events,
           providers: () => [...seenProviders],
+          // A real supervisor request is what ends this wait; generic attention notices do not.
+          // The probe reads pi-subagents' own request files, the same data `requestMatchesOwner`
+          // uses, so a request answered in an earlier turn is not counted again.
+          hasSupervisorRequest: () => supervisor.hasPending(),
           subscribe: (listener) => runtime.bridge.onChange(listener),
           nativeWait: async (waitParams, nestedSignal) => {
             if (!pi.getAllTools().some((tool) => tool.name === "bg_wait")) {
               return "native bg_wait is not registered in this session; skipped.";
             }
             const outcome = await ctx.executeTool("bg_wait", waitParams, { signal: nestedSignal });
-            return textOf(outcome);
+            const text = textOf(outcome);
+            // The native tool can be blocked or disabled; its no-work answer must not be
+            // reported as a completed subagent wait.
+            if ((outcome as { isError?: boolean } | undefined)?.isError === true) {
+              return `native bg_wait failed: ${text}`;
+            }
+            return text;
           },
         });
         const result = await runner(

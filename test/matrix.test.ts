@@ -84,17 +84,32 @@ async function seed(h: ReturnType<typeof harness>, ids: string[]) {
 
 // ---- row 1: only a subagent -------------------------------------------------------------
 
-test("row 1 仅一个子代理 → 正常等待并返回 (native bg_wait reports provider work)", async () => {
+test("row 1 仅一个子代理 → 正常等待并返回 (session-wide call delegates the subagent scope to native bg_wait)", async () => {
   const h = harness();
   await h.bridge.refreshNow();
   await until(() => h.bridge.owned());
-  // A session with no running provider work: native bg_wait answers "nothing to wait for"
-  // for the provider scope, so the subagent scope is the only live scope.
+  // A session with no running provider work: the provider scope is empty, so the subagent
+  // scope is the only live scope and native bg_wait must own it.
   const snapshot = h.bridge.provider.listActiveWork({ sessionId: "sess-A", sessionIds: ["C:/sessions/A.jsonl", "sess-A"], nowMs: Date.now() });
   assert.deepEqual(snapshot, []);
-  // The unified tool must not invent work either.
-  const result = await h.runner({ all: true, timeoutMs: 100 }, undefined, undefined, undefined);
-  assert.match(result.text, /nothing to wait for/i);
+  // A session-wide call must not claim "nothing to wait for" while a subagent may be live:
+  // it delegates that scope to the native tool (the post-reload case).
+  let nativeCalls = 0;
+  const runner = createUnifiedToolRunner({
+    bridge: h.bridge,
+    events: h.bus,
+    providers: () => [...h.providers.keys()],
+    subscribe: (listener) => h.bridge.onChange(listener),
+    nativeWait: async () => {
+      nativeCalls += 1;
+      return "Waited 1.2s for run \"sub-1\"; done. Outcome: 1 complete.";
+    },
+  });
+  const result = await runner({ all: true, timeoutMs: 5000 }, undefined, undefined, undefined);
+  assert.equal(nativeCalls, 1, "the subagent scope must be delegated to native bg_wait");
+  assert.match(result.text, /No background task of this session is running/i);
+  assert.match(result.text, /1 complete/i, "the native answer must reach the model, not be dropped");
+  assert.equal(result.failed, false);
   h.bridge.dispose();
 });
 

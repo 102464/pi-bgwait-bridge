@@ -6,7 +6,10 @@
  *    fallback, an abort signal, and a user-input signal.
  *  - Timeout ends the wait window only; it never kills the work.
  *  - Supervisor asks and typed user input end the wait with a distinct outcome.
- *  - `stopOnAttention:false` keeps ordinary idle reminders from ending the wait.
+ *  - Generic "attention" notices (an open tool at 240 s, repeated tool failures) never end
+ *    this wait. Native `bg_wait` only ends on those when the caller opts in with
+ *    `stopOnAttention:true` (subagent-wait.js:638), and that flag is forwarded to the native
+ *    half untouched; it is not re-interpreted here.
  */
 import type { TerminalRecord } from "./bridge.ts";
 import { DEFAULT_POLL_MS, MIN_POLL_MS } from "./constants.ts";
@@ -52,7 +55,6 @@ export interface WaitRequest {
   timeoutMs: number;
   signal?: AbortSignal | undefined;
   userInputSignal?: AbortSignal | undefined;
-  stopOnAttention?: boolean;
   onTick?: (state: { elapsedMs: number; active: string[]; finished: string[] }) => void;
 }
 
@@ -81,7 +83,6 @@ export async function waitForWork(scope: WaitScope, request: WaitRequest, deps: 
   const pollMs = Math.max(MIN_POLL_MS, deps.pollIntervalMs ?? DEFAULT_POLL_MS);
   const initialIds = new Set(scope.taskIds);
   const initialProviders = deps.providers?.() ?? [];
-  const stopOnAttention = request.stopOnAttention !== false;
 
   // Wakes: provider/item state changes plus the wake channels pi-subagents itself listens to.
   let wakeResolve: (() => void) | undefined;
@@ -173,7 +174,6 @@ export async function waitForWork(scope: WaitScope, request: WaitRequest, deps: 
       if (deps.maxIdleTicks !== undefined && idleTicks > deps.maxIdleTicks && active.length === 0 && initialIds.size > 0) {
         return { kind: "settled", reason: "all" };
       }
-      if (stopOnAttention && deps.hasSupervisorRequest?.()) return { kind: "supervisor_request" };
     }
   } finally {
     cleanup();

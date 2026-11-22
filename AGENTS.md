@@ -37,10 +37,12 @@ suite fails.
 | A failed or killed task is a failure, never success | `src/unified-tool.ts`, `test/matrix.test.ts` row 11 |
 | Timeout ends the window, never the work | `src/wait-core.ts`, rows 12 |
 | Only typed streaming input aborts a wait | `test/extension.test.ts`, rows 9–10 |
-| A supervisor request ends a wait even with `stopOnAttention:false` | rows 8 |
+| A supervisor request ends a wait even with `stopOnAttention:false` | rows 8, `src/supervisor-probe.ts` |
+| A generic attention notice (open tool 240 s, 3 failed tools) never ends a wait | `test/mixed-scope-defaults.test.ts`, `test/supervisor-probe.test.ts` |
 | Provider disappearance fails closed | `src/wait-core.ts#providerLost` |
 | Notification flags are never rewritten and frames are never consumed | `src/notification-coordination.ts`, `test/notification-coordination.test.ts` |
 | Registration happens at load, so `bg_wait` is declared on the first turn | `extensions/bgwait-bridge.ts`, `test/extension.test.ts` |
+| A session-wide unified wait also covers the subagent scope, even after a reload with no background task | `src/unified-tool.ts#wantsNativeScope`, `test/mixed-scope-defaults.test.ts`, `scripts/live-subagent-only.mjs` |
 | Reload replaces by name; a stale disposer cannot unregister the replacement | `src/provider-registry.ts`, `test/subagent-path.test.ts` |
 
 ## Verification contract
@@ -48,9 +50,11 @@ suite fails.
 Before claiming anything works:
 
 ```bash
-npm test                       # 68 tests: mock EventBus + controlled time
+npm test                       # 90 tests: mock EventBus + controlled time
 node scripts/live-e2e.mjs      # real Pi + real bg task + native bg_wait
 node scripts/live-mixed.mjs    # real subagent + real bg task in one native bg_wait
+node scripts/live-subagent-only.mjs  # only a subagent: session-wide unified wait must not deny it
+node scripts/live-attention.mjs      # a subagent tripping needs_attention must not end the wait
 ```
 
 `--installed` on either live script drops `-e .` so the run uses the package as installed

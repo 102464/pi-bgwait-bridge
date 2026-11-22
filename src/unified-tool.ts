@@ -45,12 +45,31 @@ export interface UnifiedToolDeps {
   hasSupervisorRequest?: () => boolean;
   /** Subscribe to local state changes (bridge.onChange). */
   subscribe?: (listener: () => void) => () => void;
-  /** Optional nested native bg_wait call. */
+  /**
+   * Nested native `bg_wait` call. Session-wide calls include the subagent scope through it
+   * by default (see `wantsNativeScope`): the native tool owns async runs, and background task
+   * ids are what this tool adds on top.
+   */
   nativeWait?: (
     params: Record<string, unknown>,
     signal: AbortSignal | undefined,
     onUpdate: (() => void) | undefined,
   ) => Promise<string>;
+}
+
+/**
+ * Whether this call should also wait for the subagent scope.
+ *
+ * Explicit `ids` mean "exactly these background tasks", so the native scope stays out unless
+ * `includeNative:true` asks for it. A session-wide call (`all`, `any`, or no ids) is the
+ * unified case this tool exists for: after a reload the only waiting work may be a subagent,
+ * and returning "no background task is running" for that would report nothing while a run is
+ * live. So the native scope is included by default there.
+ */
+export function wantsNativeScope(input: BgWaitUnifiedInput): boolean {
+  if (input.includeNative === false) return false;
+  if (input.includeNative === true) return true;
+  return !(input.ids !== undefined && input.ids.length > 0);
 }
 
 export interface UnifiedToolResult {
@@ -97,6 +116,21 @@ export function createUnifiedToolRunner(deps: UnifiedToolDeps) {
     const selection = selectIds(input, running, terminal);
     const mode: "all" | "any" = input.any === true ? "any" : "all";
     const timeoutMs = input.timeoutMs !== undefined && input.timeoutMs > 0 ? input.timeoutMs : DEFAULT_TIMEOUT_MS;
+    const useNative = wantsNativeScope(input) && deps.nativeWait !== undefined;
+    /**
+     * What the native half should stop on.
+     *
+     * Native `bg_wait` treats `stopOnAttention:true` as "end on *any* needs_attention", not just
+     * a supervisor ask (subagent-wait.js:638 short-circuits `hasSupervisorTool`). Its ordinary
+     * sources are an open tool at 240 s and three consecutive tool failures
+     * (runs/shared/subagent-control.js:9-12), so forwarding `true` by default made a healthy
+     * long-running subagent end the wait after a few milliseconds.
+     *
+     * `false` is safe here: a real supervisor request is an unconditional barrier upstream
+     * (subagent-wait.js:634-637), independent of `stopOnAttention`. Only an explicit
+     * `stopOnAttention:true` opts into the wider native behaviour.
+     */
+    const nativeStopOnAttention = input.stopOnAttention === true;
 
     // Unknown exact ids: ask the host once, by exact id. A task that finished before this
     // wait started is then answered instead of reported as "not found", and a genuinely
@@ -115,16 +149,35 @@ export function createUnifiedToolRunner(deps: UnifiedToolDeps) {
       }
     }
 
-    if (selection.ids.length === 0) {
-      const noWork = bridge.owned()
-        ? "No background task of this session is running; nothing to wait for."
-        : `No pi-background-tasks activation for this session is verified yet${bridge.lastError() ? ` (${bridge.lastError()})` : ""}; nothing to wait for.`;
-      return { text: noWork, failed: false, failedIds: [] };
-    }
+    let nativeNote = "";
+    let nativePending: Promise<void> | undefined;
+    // Started before any early return so the subagent scope is still covered when this
+    // session has no background task of its own (the post-reload case).
+    const startNative = (): void => {
+      if (!useNative || nativePending) return;
+      nativePending = Promise.resolve(
+        deps.nativeWait?.(
+          {
+            ...(mode === "any" ? { all: false } : { all: true }),
+            stopOnAttention: nativeStopOnAttention,
+            timeoutMs,
+          },
+          signal,
+          undefined,
+        ),
+      ).then(
+        (text) => {
+          nativeNote = text ?? "";
+        },
+        (error: unknown) => {
+          nativeNote = `native bg_wait nested call failed: ${error instanceof Error ? error.message : String(error)}`;
+        },
+      );
+    };
 
     const preTerminal = selection.preTerminal;
     // Only ids the bridge actually reports as active are waited on. An id that is neither
-    // running nor terminal is "unknown", not "finished": treating it as finished would let a
+    // running nor terminal is "unknown", not "finished": treating it as false would let a
     // typo satisfy an all-wait instantly and report it as a settled task.
     const knownActive = new Set(running.map((task) => task.id));
     const activeIds = selection.ids.filter(
@@ -138,32 +191,46 @@ export function createUnifiedToolRunner(deps: UnifiedToolDeps) {
       return summarise({ mode, elapsedMs: 0, ids: selection.ids, terminal, preTerminal, outcome: { kind: "settled", reason: "any" }, missing: selection.missing, failed: false, failedIds: [] });
     }
     if (activeIds.length === 0) {
-      if (preTerminal.length === 0) {
+      if (preTerminal.length === 0 && selection.ids.length > 0) {
         const text =
           unknownIds.length > 0
-            ? `No running or finished background task in this session matches: ${unknownIds.join(", ")}. Nothing to wait for.`
-            : bridge.owned()
-              ? "No background task of this session is running; nothing to wait for."
-              : `No pi-background-tasks activation for this session is verified yet${bridge.lastError() ? ` (${bridge.lastError()})` : ""}; nothing to wait for.`;
-        return { text, failed: false, failedIds: [] };
+            ? `No running or finished background task in this session matches: ${unknownIds.join(", ")}.`
+            : "No background task of this session is running.";
+        if (useNative) {
+          startNative();
+          await nativePending;
+          return { text: joinNotes(text, nativeNote), failed: false, failedIds: [] };
+        }
+        return { text: `${text} Nothing to wait for.`, failed: false, failedIds: [] };
+      }
+      if (preTerminal.length === 0) {
+        const noWork = bridge.owned()
+          ? "No background task of this session is running; nothing to wait for."
+          : `No pi-background-tasks activation for this session is verified yet${bridge.lastError() ? ` (${bridge.lastError()})` : ""}; nothing to wait for.`;
+        if (!useNative) return { text: noWork, failed: false, failedIds: [] };
+        // No background task, but a session-wide wait still covers async subagents: delegate
+        // that scope to the native tool instead of claiming there is nothing to wait for.
+        startNative();
+        await nativePending;
+        return {
+          text: joinNotes("No background task of this session is running.", nativeNote || "Native wait returned no text."),
+          failed: false,
+          failedIds: [],
+        };
       }
       const failedIds = preTerminal.filter((record) => record.status === "failed").map((record) => record.id);
       const killedIds = preTerminal.filter((record) => record.status === "killed").map((record) => record.id);
-      return summarise({ mode, elapsedMs: 0, ids: selection.ids, terminal, preTerminal, outcome: { kind: "settled", reason: "all" }, missing: selection.missing, failed: failedIds.length + killedIds.length > 0, failedIds: [...failedIds, ...killedIds] });
+      const settled = summarise({ mode, elapsedMs: 0, ids: selection.ids, terminal, preTerminal, outcome: { kind: "settled", reason: "all" }, missing: selection.missing, failed: failedIds.length + killedIds.length > 0, failedIds: [...failedIds, ...killedIds] });
+      if (useNative) {
+        startNative();
+        await nativePending;
+        return { ...settled, text: joinNotes(settled.text, nativeNote) };
+      }
+      return settled;
     }
 
     const startedAt = now();
-    let nativeNote = "";
-    const nativePromise = input.includeNative && deps.nativeWait
-      ? deps.nativeWait({ all: true, stopOnAttention: input.stopOnAttention ?? true, timeoutMs }, signal, undefined).then(
-          (text) => {
-            nativeNote = text;
-          },
-          (error: unknown) => {
-            nativeNote = `native bg_wait nested call failed: ${error instanceof Error ? error.message : String(error)}`;
-          },
-        )
-      : undefined;
+    startNative();
 
     const outcome: WaitOutcome = await waitForWork(
       { taskIds: activeIds },
@@ -172,7 +239,6 @@ export function createUnifiedToolRunner(deps: UnifiedToolDeps) {
         timeoutMs,
         signal,
         userInputSignal,
-        stopOnAttention: input.stopOnAttention ?? true,
         onTick: ({ elapsedMs, active }) => {
           onUpdate?.({
             text: `Waiting on ${String(active.length)} background task(s) for ${formatDuration(elapsedMs)}: ${active.join(", ")}`,
@@ -191,7 +257,7 @@ export function createUnifiedToolRunner(deps: UnifiedToolDeps) {
       },
     );
 
-    if (nativePromise) await Promise.race([nativePromise, Promise.resolve()]);
+    if (nativePending) await nativePending;
 
     const elapsedMs = now() - startedAt;
     const finalTerminal = bridge.terminal();
@@ -239,6 +305,10 @@ interface SummariseInput {
   failedIds: readonly string[];
   nativeNote?: string;
   coordinationLines?: readonly string[];
+}
+
+function joinNotes(primary: string, secondary: string): string {
+  return secondary.length > 0 ? `${primary}\n\nNative wait: ${secondary}` : primary;
 }
 
 function summarise(input: SummariseInput): UnifiedToolResult {

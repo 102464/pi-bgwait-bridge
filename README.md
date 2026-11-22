@@ -126,14 +126,14 @@ Covers this session's async subagent runs **and** this session's pi-background-t
 // exactly these two tasks, ignoring anything else this session launched
 bg_wait_unified({ ids: ["abc123", "def456"], timeoutMs: 3600000 })
 
-// every background task running when the wait starts
+// the whole session: background tasks running at wait start **and** async subagents
 bg_wait_unified({ all: true, stopOnAttention: false, timeoutMs: 3600000 })
 
-// first one to finish
+// first one to finish, either scope
 bg_wait_unified({ any: true, ids: ["abc123", "def456"] })
 
-// also wait for async subagents in the same call (nests one native bg_wait)
-bg_wait_unified({ all: true, includeNative: true })
+// exact ids plus the subagent scope
+bg_wait_unified({ ids: ["abc123"], includeNative: true })
 ```
 
 Parameters:
@@ -141,11 +141,17 @@ Parameters:
 | Field | Meaning |
 | --- | --- |
 | `ids` | exact background task ids (no prefixes), max 64 |
-| `all` | every task running at wait start |
+| `all` | every task running at wait start (plus async subagents — see below) |
 | `any` | return on the first terminal state |
 | `timeoutMs` | wait window; **never kills** the work |
-| `stopOnAttention` | default `true`; a supervisor request ends the wait, idle reminders never do |
-| `includeNative` | also wait for async runs (nests one `bg_wait`) |
+| `stopOnAttention` | **opt-in**, default `false`. A real subagent supervisor request always ends the wait; `true` additionally ends it on native attention notices (an open tool at 240 s, three consecutive tool failures) |
+| `includeNative` | `true` forces the subagent scope, `false` opts out |
+
+**Subagent scope.** A session-wide call (`all`, `any`, or no `ids`) also waits for async
+subagents by nesting one native `bg_wait`; explicit `ids` mean "exactly these background
+tasks" and stay background-only unless `includeNative:true` is set. This is why a
+`bg_wait_unified({all:true})` issued right after `/reload` still waits for a running
+subagent instead of answering "no background task is running".
 
 A failed or killed task is reported as a failure (`isError: true`, `details.failed`,
 `details.failedIds`), never as success.
@@ -183,9 +189,11 @@ them — and the wait result says so:
 ## Testing
 
 ```bash
-npm test                       # 68 unit tests, mock EventBus + controlled time
+npm test                       # 90 unit tests, mock EventBus + controlled time
 node scripts/live-e2e.mjs      # real pi process, real bg task, native bg_wait
 node scripts/live-mixed.mjs    # real subagent + real bg task, one native bg_wait
+node scripts/live-subagent-only.mjs  # only a subagent running: the unified wait must still wait
+node scripts/live-attention.mjs      # attention notices must not end the wait early
 ```
 
 The live scripts need `pi` on `PATH` (or `PI_LAUNCHER=<path to pi-launcher.js>`), take

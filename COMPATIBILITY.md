@@ -16,7 +16,7 @@ carries the row number and the original scenario text inline.
 
 | Row | Scenario | Expected | Covered by |
 | --- | --- | --- | --- |
-| 1 | 仅一个子代理 | 正常等待并返回 | `matrix.test.ts` row 1 (provider scope empty; native `bg_wait` owns the run scope), `live-mixed.mjs` |
+| 1 | 仅一个子代理 | 正常等待并返回 | `matrix.test.ts` row 1, `mixed-scope-defaults.test.ts` (session-wide call delegates the run scope to native `bg_wait`), `live-mixed.mjs` |
 | 2 | 仅一个 bg_run 任务 | 正常等待并返回 | `matrix.test.ts` row 2, `live-e2e.mjs` |
 | 3 | 三个 bg_run 并行 | `all:true` 等待全部完成 | `matrix.test.ts` row 3 |
 | 4 | 两个子代理 + 一个 bg_run | `all:true` 等待三者全部完成 | `matrix.test.ts` row 4, **`live-mixed.mjs`** (1 async run + 1 provider item in one native `bg_wait`) |
@@ -35,11 +35,16 @@ carries the row number and the original scenario text inline.
 
 Run records:
 
-- `npm test` → **68 tests, 68 pass, 0 fail** (`evidence/unit-tests.log`)
+- `npm test` → **90 tests, 90 pass, 0 fail** (`evidence/unit-tests.log`)
 - `node scripts/live-e2e.mjs` → **10/10 live checks pass** (`evidence/live-e2e.log`)
 - `node scripts/live-mixed.mjs` → **9/9 live checks pass** (`evidence/live-mixed.log`)
-- Both live scripts also pass with `--installed`, i.e. loaded from `settings.json`
-  (`evidence/live-e2e-installed.log`, `evidence/live-mixed-installed.log`)
+- `node scripts/live-subagent-only.mjs` → **5/5 live checks pass** (`evidence/live-subagent-only.log`)
+  — the post-reload regression: only a subagent running, one `bg_wait_unified({all:true})`
+- `node scripts/live-attention.mjs` → **6/6 live checks pass** (`evidence/live-attention.log`)
+  — the attention regression: a subagent tripping `needs_attention` must not end the wait
+- All four live scripts also pass with `--installed`, i.e. loaded from `settings.json`
+  (`evidence/live-e2e-installed.log`, `evidence/live-mixed-installed.log`,
+  `evidence/live-subagent-only-installed.log`, `evidence/live-attention-installed.log`)
 
 ### Not covered: extension load order
 
@@ -54,6 +59,73 @@ the part that matters for Goal-X compatibility.
 The operational consequence: after installing, **`/reload` (or restart Pi) before trusting a
 `bg_wait` result**. This is a property of Pi's extension loading, not a bug this package can
 fix without patching the host.
+
+## Mixed-scope defaults (fix for the post-reload empty wait)
+
+Before this fix, `bg_wait_unified({all:true})` after a `/reload` — with only an async subagent
+running — answered `No background task of this session is running; nothing to wait for.`
+The tool is advertised as mixed-scope, so that answer was wrong: work was in flight.
+
+Rule now (`src/unified-tool.ts#wantsNativeScope`):
+
+| Call | Subagent scope |
+| --- | --- |
+| `{all:true}`, `{any:true}`, `{}` | included — delegates one native `bg_wait` |
+| `{ids:[…]}` | excluded (exact background tasks only) |
+| `{…, includeNative:true}` | included |
+| `{…, includeNative:false}` | excluded |
+
+When the background scope is empty but the native scope is live, the native verdict is
+reported verbatim instead of being replaced by a "nothing to wait for" line, and a nested
+native failure is surfaced rather than counted as a completed wait. Covered by
+`test/mixed-scope-defaults.test.ts` (11 cases) plus `matrix.test.ts` row 1.
+
+## Attention notices (fix for the "attention required" early return)
+
+`bg_wait_unified({all:true})` once returned after **7 ms** with `attention required` while the
+subagent was still working.
+
+Cause: the tool forwarded `stopOnAttention:true` to native `bg_wait`. In pi-subagents 0.89.2,
+
+```js
+// subagent-wait.js:630,638
+const stopOnAttention = params.stopOnAttention ?? deps.stopOnAttention !== false;
+if (attention.some((run) => initialAsyncIds.has(run.id) && (stopOnAttention || hasSupervisorTool(run))))
+```
+
+`stopOnAttention:true` short-circuits the supervisor test, so **any** `needs_attention` ends the
+wait. Its ordinary sources (`runs/shared/subagent-control.js:9-12`) are an open tool at 240 s
+(`activeNoticeAfterMs`) and three consecutive failing mutating tools
+(`failedToolAttemptsBeforeAttention`). None of those is a supervisor ask.
+
+Rule now:
+
+| Call | Ends on a real supervisor request | Ends on a generic attention notice |
+| --- | --- | --- |
+| default / `stopOnAttention:false` | yes (unconditional barrier, `subagent-wait.js:634-637`) | no |
+| `stopOnAttention:true` | yes | yes (native behaviour, explicit opt-in) |
+
+The unified wait's own loop no longer re-interprets the flag at all; it only forwards it to the
+native half. A real supervisor request is detected by `src/supervisor-probe.ts`, which reads
+pi-subagents' own request files (`supervisor-channels/<run>-<agent>-<child>/requests/*.json`),
+skipping notices without `expectsReply`, expired requests and requests that already have a
+reply file — the same lifecycle `requestLifecycle` (native-supervisor-channel.js:446-458)
+applies. An event-flag listener was rejected because a request is resolved in the parent tool
+(`subagent_supervisor({action:"reply"})`, :613-620) or in pi-subagents' own poll, so an outside
+observer could never learn it was answered and would latch "pending" forever.
+
+Covered by `test/mixed-scope-defaults.test.ts` (opt-in behaviour),
+`test/supervisor-probe.test.ts` (11 cases) and `scripts/live-attention.mjs` (real Pi: a
+subagent trips the failure path, the wait still runs ~44 s and ends `done`).
+
+## In-process verification (this session, after the fix)
+
+`evidence/in-process-live-verification.md` records 12 scenarios executed inside the Pi session
+that had the fixed extension loaded — two `bg_run` alone returning
+`0 async run(s) and 2 provider item(s)` (no `No active async runs`), three bg tasks plus one
+subagent under `{all:true}`, `{any:true}` early return, exact ids, timeout-with-work-continuing,
+a generic attention notice not ending the wait, and a real supervisor request ending it in 8 s
+while a 40 s bg task kept running.
 
 ## Platform support
 

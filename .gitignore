@@ -6,13 +6,19 @@ node_modules/
 # Pi session + background-task state (per-machine, never portable).
 .pi/
 
-# Live-E2E and unit-test output. `evidence/` is documentation-referenced
-# (COMPATIBILITY.md cites each run log by name, including the `-installed`
-# variants), so the whole directory is tracked on purpose. Do not add per-file
-# rules here: a log that ships with a compatibility claim must stay in the tree.
+# Live-E2E and unit-test output. `evidence/` is produced locally by the commands
+# COMPATIBILITY.md names next to each claim; a run log is a per-machine
+# observation, so it is never committed. Re-run the listed command to check the
+# claim on your machine.
+evidence/
 
 # Editors / OS
 .DS_Store
 Thumbs.db
 .idea/
 .vscode/
+
+# `> nul` under MSYS lands as a real file named `nul` (the cmd.exe null device cannot
+# be opened as a path there). The live probes redirect to it, so it keeps reappearing;
+# it is an artifact, never source.
+nul
